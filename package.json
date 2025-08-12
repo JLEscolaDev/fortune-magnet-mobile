@@ -3,10 +3,25 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "mobile:init": "npx cap init 'Fortune Magnet' com.fortunemagnet.app --web-dir=dist || true",
+    "mobile:add:ios": "npx cap add ios || true",
+    "mobile:add:android": "npx cap add android || true",
+    "mobile:build": "echo skip && true",
+    "mobile:copy": "npx cap copy",
+    "mobile:sync": "npx cap sync",
+    "mobile:ios": "npm run mobile:sync && npx cap open ios",
+    "mobile:android": "npm run mobile:sync && npx cap open android"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "devDependencies": {
+    "@capacitor/cli": "^7.4.2"
+  },
+  "dependencies": {
+    "@capacitor/camera": "^7.0.2",
+    "@capacitor/core": "^7.4.2"
+  }
 }
