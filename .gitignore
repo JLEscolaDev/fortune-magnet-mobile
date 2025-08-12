@@ -1,5 +1,10 @@
-node_modules
-dist
-ios/App/build
-android/app/build
+node_modules/
+.DS_Store
+.idea/
+android/app/build/
+android/build/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+android/app/src/main/assets/
+package-lock.json
 

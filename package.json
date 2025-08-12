@@ -1,27 +1,38 @@
 {
   "name": "fortune-magnet-mobile",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "mobile:init": "npx cap init 'Fortune Magnet' com.fortunemagnet.app --web-dir=dist || true",
+    "mobile:init": "npx cap init \"Fortune Magnet\" com.fortunemagnet.app --web-dir=dist || true",
     "mobile:add:ios": "npx cap add ios || true",
     "mobile:add:android": "npx cap add android || true",
     "mobile:build": "echo skip && true",
     "mobile:copy": "npx cap copy",
     "mobile:sync": "npx cap sync",
     "mobile:ios": "npm run mobile:sync && npx cap open ios",
-    "mobile:android": "npm run mobile:sync && npx cap open android"
+    "mobile:android": "npm run mobile:sync && npx cap open android",
+    "lint": "echo \"no lint configured\"",
+    "build": "echo \"no web build (remote URL)\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "devDependencies": {
-    "@capacitor/cli": "^7.4.2"
+    "@capacitor/cli": "^7.4.2",
+    "@types/node": "^24.2.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
   },
   "dependencies": {
+    "@capacitor/android": "^7.4.2",
     "@capacitor/camera": "^7.0.2",
-    "@capacitor/core": "^7.4.2"
+    "@capacitor/core": "^7.4.2",
+    "@capacitor/ios": "^7.4.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": "\""
   }
 }
