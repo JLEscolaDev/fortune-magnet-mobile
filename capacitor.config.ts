@@ -1,6 +1,9 @@
-import { CapacitorConfig } from '@capacitor/cli';
+import type { CapacitorConfig } from '@capacitor/cli';
 
-const remoteUrl = process.env.VITE_MOBILE_REMOTE_URL ?? 'https://fortune-magnet.vercel.app';
+const remoteUrl =
+  process.env.VITE_MOBILE_REMOTE_URL ||
+  process.env.MOBILE_REMOTE_URL ||
+  'https://fortune-magnet.vercel.app';
 
 const config: CapacitorConfig = {
   appId: 'com.fortunemagnet.app',
