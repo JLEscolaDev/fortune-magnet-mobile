@@ -5,10 +5,36 @@ import Capacitor
 class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
+    private var uploaderBridge: NativeUploaderBridge?
+    private var uploaderInjected = false
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        // Try to inject bridge after a short delay to ensure window is ready
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.injectUploaderBridge()
+        }
         return true
+    }
+    
+    private func injectUploaderBridge() {
+        guard !uploaderInjected else { return }
+        
+        // Get the bridge view controller from the window
+        guard let window = window,
+              let rootViewController = window.rootViewController as? CAPBridgeViewController,
+              rootViewController.webView != nil else {
+            // Try again after a short delay if bridge isn't ready yet
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.injectUploaderBridge()
+            }
+            return
+        }
+        
+        uploaderBridge = NativeUploaderBridge(bridgeViewController: rootViewController)
+        uploaderBridge?.injectJavaScript()
+        uploaderInjected = true
+        
+        print("NativeUploaderBridge: JavaScript bridge injected")
     }
 
     func applicationWillResignActive(_ application: UIApplication) {
@@ -27,6 +53,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+        // Try to inject bridge if not already injected
+        if !uploaderInjected {
+            injectUploaderBridge()
+        }
     }
 
     func applicationWillTerminate(_ application: UIApplication) {
