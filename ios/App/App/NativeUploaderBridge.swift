@@ -514,9 +514,12 @@ import Capacitor
                         
                         console.log('TICKET_OK bucketRelativePath=' + bucketRelativePath);
                         
-                        // Step 2: Upload to Supabase signed upload URL
-                        // IMPORTANT: createSignedUploadUrl expects a raw PUT of the file bytes, NOT multipart.
-                        // We send the Blob directly.
+                        // Step 2: Upload to Supabase signed upload URL via POST multipart/form-data
+                        // Use FormData so Content-Type with boundary is set automatically by fetch
+                        var formData = new FormData();
+                        formData.append(formFieldName, imageBlob, 'photo.jpg');
+                        
+                        // Build upload headers from ticket (use requiredHeaders, do NOT set Content-Type - fetch will set it automatically with boundary)
                         var uploadHeaders = {};
                         if (requiredHeaders && typeof requiredHeaders === 'object') {
                           for (var key in requiredHeaders) {
@@ -525,20 +528,17 @@ import Capacitor
                             }
                           }
                         }
-                        // Ensure Content-Type is present
-                        if (!uploadHeaders['Content-Type'] && mimeType) {
-                          uploadHeaders['Content-Type'] = mimeType;
-                        }
-                        // Ensure x-upsert default
+                        // Ensure x-upsert default if not in ticket
                         if (!uploadHeaders['x-upsert']) {
                           uploadHeaders['x-upsert'] = 'true';
                         }
-
-                        console.log('[NativeUploader] UPLOAD_START method=PUT path=' + bucketRelativePath + ' headers=' + JSON.stringify(uploadHeaders));
+                        // DO NOT set Content-Type - fetch will set it automatically with boundary when using FormData
+                        
+                        console.log('[NativeUploader] UPLOAD_START method=POST path=' + bucketRelativePath + ' field=' + formFieldName + ' headers=' + JSON.stringify(uploadHeaders));
                         var uploadResponse = await fetch(uploadUrl, {
-                          method: 'PUT',
+                          method: 'POST',
                           headers: uploadHeaders,
-                          body: imageBlob
+                          body: formData
                         });
 
                         var uploadStatus = uploadResponse.status;
