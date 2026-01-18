@@ -8,6 +8,7 @@ import Capacitor
  */
 @objc class NativeUploaderBridge: NSObject {
     private static let TAG = "NativeUploaderBridge"
+    private static let NATIVE_UPLOADER_IMPL_VERSION = "ios-injected-v3-2026-01-18"
     
     weak var bridgeViewController: CAPBridgeViewController?
     
@@ -20,17 +21,66 @@ import Capacitor
         let bootstrapJS = """
         (function(){
           try {
+            var IMPL_VERSION = "\(NativeUploaderBridge.NATIVE_UPLOADER_IMPL_VERSION)";
+            
+            // Check if NativeUploader already exists with __impl defined (versioned implementation)
+            if (window.NativeUploader && window.NativeUploader.__impl) {
+              console.log("[NATIVE-UPLOADER][INJECTED] existing implementation detected, skipping install", window.NativeUploader.__impl);
+              return; // Do NOT overwrite versioned implementation
+            }
+            
+            // If NativeUploader exists but has no __impl, log warning but still install
+            if (window.NativeUploader && !window.NativeUploader.__impl) {
+              console.log("[NATIVE-UPLOADER][INJECTED] overriding non-versioned NativeUploader");
+            }
+            
             if (typeof window.NativeUploaderAvailable === 'undefined') {
               window.NativeUploaderAvailable = true;
-              if (!window.NativeUploader) window.NativeUploader = {};
-              if (!window.__nativeUploadResolvers) window.__nativeUploadResolvers = {};
-              if (!window.__nativeUploadReqId) window.__nativeUploadReqId = 0;
-              
-              window.NativeUploader.pickAndUploadFortunePhoto = function(options){
-                console.log('[NativeUploader] FUNCTION CALLED - pickAndUploadFortunePhoto entry point');
+            }
+            if (!window.NativeUploader) window.NativeUploader = {};
+            if (!window.__nativeUploadResolvers) window.__nativeUploadResolvers = {};
+            if (!window.__nativeUploadReqId) window.__nativeUploadReqId = 0;
+            
+            // Set implementation version identifier
+            window.NativeUploader.__impl = IMPL_VERSION;
+            console.log("[NATIVE-UPLOADER][INJECTED] installed", window.NativeUploader.__impl);
+            
+            // Helper function to log to Xcode console - uses console.log which Capacitor forwards to Xcode
+            // These logs WILL appear in Xcode console with prefix "⚡️  [log]"
+            window.__nativeLogToXcode = function(message) {
+              console.log('[NATIVE-LOG] ' + message);
+              // Also send to debug server
+              try {
+                fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:__nativeLogToXcode',message:'XCODE_LOG',data:{message:message},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A,B,C,D,E'})}).catch(()=>{});
+              } catch(e) {}
+            };
+            
+            window.NativeUploader.pickAndUploadFortunePhoto = function(options){
+                // CRITICAL: Log immediately to confirm function is called and detect implementation
+                var currentImpl = window.NativeUploader ? window.NativeUploader.__impl : null;
+                console.log("[NATIVE-UPLOADER][INJECTED] FUNCTION CALLED - pickAndUploadFortunePhoto entry point");
+                console.log("[NATIVE-UPLOADER][INJECTED] implementation version:", currentImpl || "none");
+                if (typeof window.__nativeLogToXcode === 'function') {
+                  window.__nativeLogToXcode('FUNCTION_CALLED pickAndUploadFortunePhoto impl=' + (currentImpl || 'none'));
+                }
                 console.log('[NativeUploader] Options:', JSON.stringify(options || {}).substring(0, 200));
-                return new Promise(async function(resolve){
+                
+                // Guard against duplicate parallel uploads
+                if (!window.__nativeUploadActive) {
+                  window.__nativeUploadActive = false;
+                }
+                if (window.__nativeUploadActive) {
+                  console.log('[NATIVE-UPLOADER][INJECTED] Upload already in progress, returning busy');
+                  return Promise.resolve({ error: true, stage: 'busy' });
+                }
+                window.__nativeUploadActive = true;
+                
+                // Wrap in Promise with explicit error handling to ensure errors are never swallowed
+                return new Promise(async function(resolve, reject){
                   console.log('[NativeUploader] Promise created');
+                  if (typeof window.__nativeLogToXcode === 'function') {
+                    window.__nativeLogToXcode('PROMISE_CREATED');
+                  }
                   // #region agent log
                   fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:29',message:'pickAndUploadFortunePhoto entry',data:{hasOptions:!!options},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A,B,C,D,E'})}).catch(()=>{});
                   // #endregion
@@ -44,6 +94,7 @@ import Capacitor
                       return;
                     }
                     resolved = true;
+                    window.__nativeUploadActive = false; // Clear busy flag on resolve
                     resolve(result);
                   };
                   
@@ -210,12 +261,42 @@ import Capacitor
                         });
                         
                         console.log('[NativeUploader] Ticket response received - status:', ticketResponse.status, 'ok:', ticketResponse.ok);
+                        // Log to window.console IMMEDIATELY after receiving response
+                        if (typeof window !== 'undefined' && window.console) {
+                          window.console.log('[NATIVE-UPLOADER] TICKET_RESPONSE_RECEIVED status=' + ticketResponse.status + ' ok=' + ticketResponse.ok);
+                          window.console.error('[NATIVE-UPLOADER] TICKET_RESPONSE_RECEIVED_ERROR status=' + ticketResponse.status + ' ok=' + ticketResponse.ok);
+                        }
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:212',message:'TICKET_RESPONSE_RECEIVED',data:{requestId:id,status:ticketResponse.status,ok:ticketResponse.ok},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A,B,C,D,E'})}).catch(()=>{});
+                        // #endregion
                         
                         // Always read response body, even for 200 status
                         var responseText = await ticketResponse.text();
-                        console.error('[NativeUploader] ⚠️ CRITICAL: Ticket response status:', ticketResponse.status);
-                        console.error('[NativeUploader] ⚠️ CRITICAL: Ticket response text length:', responseText.length);
-                        console.error('[NativeUploader] ⚠️ CRITICAL: Ticket response text (FULL BODY):', responseText);
+                        // CRITICAL: Log to window.console.error with a format the wrapper web can capture
+                        // This will appear in Xcode console as "⚡️  [log] - [NATIVE-UPLOADER] ..."
+                        if (typeof window !== 'undefined' && window.console) {
+                          window.console.error('[NATIVE-UPLOADER] TICKET_TEXT_READ length=' + responseText.length);
+                          window.console.error('[NATIVE-UPLOADER] TICKET_RESPONSE_TEXT_FULL: ' + responseText);
+                          // Also try console.log
+                          window.console.log('[NATIVE-UPLOADER] TICKET_TEXT_READ length=' + responseText.length);
+                          window.console.log('[NATIVE-UPLOADER] TICKET_RESPONSE_TEXT_FULL: ' + responseText);
+                        }
+                        // Log to Xcode console via helper function
+                        if (typeof window.__nativeLogToXcode === 'function') {
+                          window.__nativeLogToXcode('TICKET_TEXT_READ length=' + responseText.length);
+                          window.__nativeLogToXcode('TICKET_RESPONSE_TEXT: ' + responseText.substring(0, 500));
+                          if (responseText.length > 500) {
+                            window.__nativeLogToXcode('TICKET_RESPONSE_TEXT (cont): ' + responseText.substring(500));
+                          }
+                        }
+                        console.log('[NativeUploader] 🔍🔍🔍 TICKET RESPONSE TEXT (FULL):', responseText);
+                        console.log('[NativeUploader] 🔍🔍🔍 TICKET RESPONSE TEXT LENGTH:', responseText.length);
+                        // Force log to console with multiple methods
+                        console.error('[NativeUploader] ⚠️⚠️⚠️ CRITICAL TICKET RESPONSE:', responseText);
+                        console.warn('[NativeUploader] ⚠️⚠️⚠️ CRITICAL TICKET RESPONSE:', responseText);
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:217',message:'TICKET_RESPONSE_TEXT_READ',data:{requestId:id,textLength:responseText.length,textPreview:responseText.substring(0,500),fullText:responseText},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A,B,C,D,E'})}).catch(()=>{});
+                        // #endregion
                         
                         if (!ticketResponse.ok) {
                           console.error('[NativeUploader] Failed to issue upload ticket:', ticketResponse.status, responseText);
@@ -228,99 +309,115 @@ import Capacitor
                         // #endregion
                         
                         var ticketData = null;
-                        console.error('[NativeUploader] ⚠️ CRITICAL: About to parse ticket JSON response...');
+                        console.log('[NativeUploader] 🔍 About to parse ticket JSON response...');
+                        console.log('[NativeUploader] 🔍 Response text length:', responseText.length);
+                        console.log('[NativeUploader] 🔍 Response text preview:', responseText.substring(0, 500));
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:231',message:'BEFORE_PARSE',data:{requestId:id,responseTextLength:responseText.length,responseTextPreview:responseText.substring(0,500)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                        // #endregion
                         try {
                           ticketData = JSON.parse(responseText);
-                          console.error('[NativeUploader] ⚠️ CRITICAL: Ticket JSON parsed successfully');
+                          
+                          // ALWAYS log ticket keys - REQUIRED DEBUG LOG
+                          var ticketKeys = Object.keys(ticketData).sort();
+                          console.log('[NATIVE-UPLOADER] ticket json keys: ' + ticketKeys.join(', '));
+                          if (typeof window !== 'undefined' && window.console) {
+                            window.console.log('[NATIVE-UPLOADER] ticket json keys: ' + ticketKeys.join(', '));
+                          }
+                          
+                          // Log to Xcode console via helper function - THIS WILL APPEAR IN XCODE
+                          if (typeof window.__nativeLogToXcode === 'function') {
+                            window.__nativeLogToXcode('TICKET_PARSED keys: ' + ticketKeys.join(', '));
+                            window.__nativeLogToXcode('TICKET_PARSED hasUrl: ' + !!ticketData.url);
+                            window.__nativeLogToXcode('TICKET_PARSED hasPath: ' + !!(ticketData.bucketRelativePath || ticketData.path));
+                            window.__nativeLogToXcode('TICKET_PARSED url: ' + (ticketData.url || 'null'));
+                            window.__nativeLogToXcode('TICKET_PARSED bucketRelativePath: ' + (ticketData.bucketRelativePath || 'null'));
+                            window.__nativeLogToXcode('TICKET_PARSED path: ' + (ticketData.path || 'null'));
+                            var ticketDataStr = JSON.stringify(ticketData);
+                            window.__nativeLogToXcode('TICKET_PARSED FULL: ' + ticketDataStr.substring(0, 500));
+                            if (ticketDataStr.length > 500) {
+                              window.__nativeLogToXcode('TICKET_PARSED FULL (cont): ' + ticketDataStr.substring(500));
+                            }
+                          }
+                          // Also log to window.console for wrapper web to see
+                          if (typeof window !== 'undefined' && window.console) {
+                            window.console.log('[NATIVE-UPLOADER] TICKET_PARSED keys:', Object.keys(ticketData).join(', '));
+                            window.console.log('[NATIVE-UPLOADER] TICKET_PARSED hasUrl:', !!ticketData.url);
+                            window.console.log('[NATIVE-UPLOADER] TICKET_PARSED hasPath:', !!(ticketData.bucketRelativePath || ticketData.path));
+                          }
+                          console.log('[NativeUploader] ✅ Ticket JSON parsed successfully');
+                          console.log('[NativeUploader] ✅ Ticket keys:', Object.keys(ticketData).join(', '));
+                          // #region agent log
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:238',message:'PARSE_SUCCESS',data:{requestId:id,ticketKeys:Object.keys(ticketData),hasUrl:!!ticketData.url,hasPath:!!(ticketData.bucketRelativePath || ticketData.path),url:ticketData.url,bucketRelativePath:ticketData.bucketRelativePath,path:ticketData.path,ticketDataFull:JSON.stringify(ticketData)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A,B,C,D,E'})}).catch(()=>{});
+                          // #endregion
                         } catch (parseError) {
                           // #region agent log
-                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:250',message:'RESOLVING ERROR - ticket JSON parse failed',data:{requestId:id,error:parseError.message || String(parseError),responseText:responseText.substring(0,500)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:241',message:'RESOLVING ERROR - ticket JSON parse failed',data:{requestId:id,error:parseError.message || String(parseError),responseText:responseText.substring(0,500)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
                           // #endregion
                           console.error('[NativeUploader] ❌ ERROR: Failed to parse ticket response as JSON:', parseError);
                           console.error('[NativeUploader] ❌ ERROR: Parse error message:', parseError.message);
                           console.error('[NativeUploader] ❌ ERROR: Parse error stack:', parseError.stack);
                           console.error('[NativeUploader] ❌ ERROR: Raw response text:', responseText);
-                          resolveOnce({ success: false, error: 'Failed to parse ticket response: ' + (parseError.message || 'Invalid JSON') });
+                          resolveOnce({ success: false, error: 'Failed to parse ticket response: ' + (parseError.message || 'Invalid JSON'), stage: 'ticket' });
                           return;
                         }
                         
                         // #region agent log
-                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:257',message:'AFTER ticket JSON parse',data:{requestId:id,hasTicketData:!!ticketData,hasUrl:!!(ticketData && ticketData.url),hasPath:!!(ticketData && (ticketData.bucketRelativePath || ticketData.path)),ticketKeys:ticketData ? Object.keys(ticketData) : []},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:247',message:'AFTER ticket JSON parse',data:{requestId:id,hasTicketData:!!ticketData,hasUrl:!!(ticketData && ticketData.url),hasPath:!!(ticketData && (ticketData.bucketRelativePath || ticketData.path)),ticketKeys:ticketData ? Object.keys(ticketData) : []},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
                         // #endregion
                         
                         // Log ALL keys in ticketData
                         console.error('[NativeUploader] ⚠️ CRITICAL: Ticket data ALL keys:', ticketData ? Object.keys(ticketData).join(', ') : 'null');
                         console.error('[NativeUploader] ⚠️ CRITICAL: Ticket data FULL JSON:', JSON.stringify(ticketData));
+                        console.log('[NativeUploader] 🔍 DEBUG: Ticket parsed, starting field extraction...');
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:254',message:'TICKET_PARSED - starting extraction',data:{requestId:id,ticketKeys:ticketData ? Object.keys(ticketData) : [],ticketDataPreview:JSON.stringify(ticketData).substring(0,300)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                        // #endregion
                         
-                        // Wrap field extraction in try-catch to handle any unexpected data types
-                        var uploadUrl = null;
-                        var ticketId = null;
-                        var bucket = 'photos'; // Default value
-                        var bucketRelativePath = '';
-                        var formFieldName = 'file'; // Default value
+                        // Extract ticket fields with variant support - resilient to backend field name changes
+                        var uploadUrl = ticketData.url || ticketData.uploadUrl || ticketData.upload_url || ticketData.signedUrl || ticketData.signed_url || null;
+                        var bucketRelativePath = ticketData.bucketRelativePath || ticketData.path || ticketData.filePath || ticketData.dbPath || ticketData.db_path || '';
+                        var requiredHeaders = ticketData.requiredHeaders || ticketData.headers || {};
+                        var bucket = ticketData.bucket || ticketData.bucket_name || 'photos';
+                        var formFieldName = ticketData.formFieldName || 'file';
+                        var uploadMethod = ticketData.uploadMethod || 'POST_MULTIPART';
                         
-                        try {
-                          // Support BOTH legacy and new ticket formats
-                          // Safely extract values, handling null/undefined/type mismatches
-                          
-                          // Extract uploadUrl - convert to string if needed
-                          if (ticketData.url !== undefined && ticketData.url !== null) {
-                            if (typeof ticketData.url === 'string') {
-                              uploadUrl = ticketData.url;
-                            } else {
-                              uploadUrl = String(ticketData.url);
-                            }
-                          }
-                          
-                          // Extract ticketId
-                          if (ticketData.ticketId !== undefined && ticketData.ticketId !== null) {
-                            ticketId = ticketData.ticketId;
-                          }
-                          
-                          // Extract bucket with default
-                          if (ticketData.bucket !== undefined && ticketData.bucket !== null) {
-                            if (typeof ticketData.bucket === 'string') {
-                              bucket = ticketData.bucket;
-                            } else {
-                              bucket = String(ticketData.bucket);
-                            }
-                          }
-                          
-                          // Handle bucketRelativePath: new format has it, legacy format has "path"
-                          if (ticketData.bucketRelativePath !== undefined && ticketData.bucketRelativePath !== null) {
-                            if (typeof ticketData.bucketRelativePath === 'string') {
-                              bucketRelativePath = ticketData.bucketRelativePath;
-                            } else {
-                              bucketRelativePath = String(ticketData.bucketRelativePath);
-                            }
-                          } else if (ticketData.path !== undefined && ticketData.path !== null) {
-                            if (typeof ticketData.path === 'string') {
-                              bucketRelativePath = ticketData.path;
-                            } else {
-                              bucketRelativePath = String(ticketData.path);
-                            }
-                          }
-                          
-                          // Handle formFieldName: default to "file"
-                          if (ticketData.formFieldName !== undefined && ticketData.formFieldName !== null) {
-                            if (typeof ticketData.formFieldName === 'string') {
-                              formFieldName = ticketData.formFieldName;
-                            } else {
-                              formFieldName = String(ticketData.formFieldName);
-                            }
-                          }
-                        } catch (fieldExtractionError) {
-                          // Non-fatal: log warning but continue with defaults
-                          console.warn('[NativeUploader] Warning: Error extracting fields from ticket (non-fatal, using defaults):', fieldExtractionError);
-                          // Values already have defaults above
+                        // Ensure values are strings (handle type coercion)
+                        if (uploadUrl && typeof uploadUrl !== 'string') {
+                          uploadUrl = String(uploadUrl).trim();
+                        }
+                        if (bucketRelativePath && typeof bucketRelativePath !== 'string') {
+                          bucketRelativePath = String(bucketRelativePath).trim();
+                        }
+                        if (bucket && typeof bucket !== 'string') {
+                          bucket = String(bucket).trim();
+                        }
+                        if (formFieldName && typeof formFieldName !== 'string') {
+                          formFieldName = String(formFieldName).trim();
+                        }
+                        if (uploadMethod && typeof uploadMethod !== 'string') {
+                          uploadMethod = String(uploadMethod).trim();
                         }
                         
-                        // Log extracted values BEFORE parsing headers
+                        // Ensure requiredHeaders is an object
+                        if (!requiredHeaders || typeof requiredHeaders !== 'object' || Array.isArray(requiredHeaders)) {
+                          requiredHeaders = {};
+                        }
+                        
+                        // ALWAYS log parsed ticket values - REQUIRED DEBUG LOG
+                        var urlPreview = uploadUrl ? (uploadUrl.length > 80 ? uploadUrl.substring(0, 80) + '...' : uploadUrl) : 'null';
+                        console.log('[NATIVE-UPLOADER] parsed ticket: url=' + urlPreview + ', path=' + (bucketRelativePath || 'null') + ', method=' + (uploadMethod || 'null') + ', field=' + formFieldName);
+                        if (typeof window !== 'undefined' && window.console) {
+                          window.console.log('[NATIVE-UPLOADER] parsed ticket: url=' + urlPreview + ', path=' + (bucketRelativePath || 'null') + ', method=' + (uploadMethod || 'null') + ', field=' + formFieldName);
+                        }
+                        
+                        // Log extracted values BEFORE parsing headers (detailed logs)
                         console.error('[NativeUploader] ⚠️ CRITICAL: Extracted values BEFORE header parsing:');
                         console.error('[NativeUploader] ⚠️ CRITICAL:   - bucket:', bucket, '(raw:', ticketData.bucket, ')');
                         console.error('[NativeUploader] ⚠️ CRITICAL:   - url:', uploadUrl ? (uploadUrl.length > 100 ? uploadUrl.substring(0, 100) + '...' : uploadUrl) : 'MISSING', '(raw:', ticketData.url, ')');
                         console.error('[NativeUploader] ⚠️ CRITICAL:   - path:', bucketRelativePath, '(raw bucketRelativePath:', ticketData.bucketRelativePath, ', raw path:', ticketData.path, ')');
                         console.error('[NativeUploader] ⚠️ CRITICAL:   - formFieldName:', formFieldName, '(raw:', ticketData.formFieldName, ')');
+                        console.error('[NativeUploader] ⚠️ CRITICAL:   - uploadMethod:', uploadMethod, '(raw:', ticketData.uploadMethod, ')');
                         
                         // Handle headers: new format has "requiredHeaders", legacy has "headers"
                         // Make headers parsing robust: accept [String: Any] and stringify values into [String: String]
@@ -462,6 +559,16 @@ import Capacitor
                         // uploadUrl is REQUIRED (cannot proceed without it)
                         // bucketRelativePath is REQUIRED (cannot proceed without it)
                         // Headers are OPTIONAL - never fail validation due to headers
+                        console.error('[NativeUploader] ⚠️ CRITICAL: Starting validation of required fields...');
+                        console.error('[NativeUploader] ⚠️ CRITICAL: uploadUrl value:', uploadUrl);
+                        console.error('[NativeUploader] ⚠️ CRITICAL: uploadUrl type:', typeof uploadUrl);
+                        console.error('[NativeUploader] ⚠️ CRITICAL: bucketRelativePath value:', bucketRelativePath);
+                        console.error('[NativeUploader] ⚠️ CRITICAL: bucketRelativePath type:', typeof bucketRelativePath);
+                        
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:461',message:'VALIDATION_START',data:{requestId:id,hasUploadUrl:!!uploadUrl,uploadUrlType:typeof uploadUrl,uploadUrlValue:uploadUrl ? String(uploadUrl).substring(0,100) : 'null',hasBucketRelativePath:!!bucketRelativePath,bucketRelativePathType:typeof bucketRelativePath,bucketRelativePathValue:bucketRelativePath || 'null'},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                        // #endregion
+                        
                         var validationErrors = [];
                         
                         // Check uploadUrl - must be a non-empty string
@@ -472,6 +579,7 @@ import Capacitor
                             urlIsValid = true;
                           }
                         }
+                        console.error('[NativeUploader] ⚠️ CRITICAL: urlIsValid:', urlIsValid);
                         if (!urlIsValid) {
                           validationErrors.push('url is missing, empty, or invalid type (got: ' + (typeof uploadUrl) + ')');
                         }
@@ -484,14 +592,30 @@ import Capacitor
                             pathIsValid = true;
                           }
                         }
+                        console.error('[NativeUploader] ⚠️ CRITICAL: pathIsValid:', pathIsValid);
                         if (!pathIsValid) {
                           validationErrors.push('path (bucketRelativePath) is missing, empty, or invalid type (got: ' + (typeof bucketRelativePath) + ')');
+                        }
+                        
+                        console.error('[NativeUploader] ⚠️ CRITICAL: validationErrors.length:', validationErrors.length);
+                        console.error('[NativeUploader] ⚠️ CRITICAL: validationErrors:', validationErrors);
+                        
+                        // Log to Xcode console via helper function - THIS WILL APPEAR IN XCODE
+                        if (typeof window.__nativeLogToXcode === 'function') {
+                          window.__nativeLogToXcode('VALIDATION_CHECK uploadUrl=' + (uploadUrl || 'null') + ' bucketRelativePath=' + (bucketRelativePath || 'null'));
+                          window.__nativeLogToXcode('VALIDATION_CHECK validationErrors.length=' + validationErrors.length);
+                          window.__nativeLogToXcode('VALIDATION_CHECK validationErrors=' + JSON.stringify(validationErrors));
+                        }
+                        // Also log to window.console for wrapper web to see
+                        if (typeof window !== 'undefined' && window.console) {
+                          window.console.log('[NATIVE-UPLOADER] VALIDATION_CHECK uploadUrl=' + (uploadUrl || 'null') + ' bucketRelativePath=' + (bucketRelativePath || 'null'));
+                          window.console.log('[NATIVE-UPLOADER] VALIDATION_CHECK validationErrors.length=' + validationErrors.length);
                         }
                         
                         // Only fail if BOTH required fields are missing - never fail due to headers
                         if (validationErrors.length > 0) {
                           // #region agent log
-                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:288',message:'RESOLVING ERROR - missing required fields in ticket',data:{requestId:id,validationErrors:validationErrors,hasUploadUrl:!!uploadUrl,hasBucketRelativePath:!!bucketRelativePath,uploadUrlType:typeof uploadUrl,pathType:typeof bucketRelativePath,uploadUrl:uploadUrl || 'empty',bucketRelativePath:bucketRelativePath || 'empty',ticketKeys:ticketData ? Object.keys(ticketData) : [],ticketDataString:JSON.stringify(ticketData).substring(0,500)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:492',message:'RESOLVING ERROR - missing required fields in ticket',data:{requestId:id,validationErrors:validationErrors,hasUploadUrl:!!uploadUrl,hasBucketRelativePath:!!bucketRelativePath,uploadUrlType:typeof uploadUrl,pathType:typeof bucketRelativePath,uploadUrl:uploadUrl || 'empty',bucketRelativePath:bucketRelativePath || 'empty',ticketKeys:ticketData ? Object.keys(ticketData) : [],ticketDataString:JSON.stringify(ticketData).substring(0,500)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
                           // #endregion
                           console.error('[NativeUploader] ❌ ERROR: Invalid ticket response - required fields missing');
                           console.error('[NativeUploader] ❌ ERROR: Validation errors:', validationErrors);
@@ -499,7 +623,25 @@ import Capacitor
                           console.error('[NativeUploader] ❌ ERROR: bucketRelativePath:', bucketRelativePath ? ('present (' + typeof bucketRelativePath + '): "' + bucketRelativePath + '"') : 'MISSING');
                           console.error('[NativeUploader] ❌ ERROR: Full ticketData:', JSON.stringify(ticketData));
                           console.error('[NativeUploader] ❌ ERROR: This error will cause flow to cancel at stage "ticket"');
-                          resolveOnce({ success: false, error: 'Invalid upload ticket response: ' + validationErrors.join(', ') });
+                          // Log to window for wrapper web to see
+                          if (typeof window !== 'undefined' && window.console) {
+                            window.console.error('[NATIVE-UPLOADER] VALIDATION FAILED:', {
+                              validationErrors: validationErrors,
+                              uploadUrl: uploadUrl,
+                              bucketRelativePath: bucketRelativePath,
+                              ticketData: ticketData
+                            });
+                          }
+                          // #region agent log
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:535',message:'RESOLVING ERROR - validation failed',data:{requestId:id,validationErrors:validationErrors,uploadUrl:uploadUrl || 'null',bucketRelativePath:bucketRelativePath || 'null',ticketData:JSON.stringify(ticketData)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                          // #endregion
+                          resolveOnce({ 
+                            error: true, 
+                            cancelled: false, 
+                            stage: 'ticket', 
+                            message: 'Invalid upload ticket response: ' + validationErrors.join(', '),
+                            details: { presentKeys: Object.keys(ticketData) }
+                          });
                           return;
                         }
                         
@@ -556,14 +698,23 @@ import Capacitor
 
                         if (uploadStatus === 200 || uploadStatus === 201 || uploadStatus === 204) {
                           console.log('UPLOAD_OK status=' + uploadStatus + ' body=' + uploadBodyPreview);
+                          // #region agent log
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:557',message:'UPLOAD_OK - proceeding to verify',data:{requestId:id,status:uploadStatus,bodyPreview:uploadBodyPreview.substring(0,100)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                          // #endregion
                         } else {
                           console.error('UPLOAD_FAIL status=' + uploadStatus + ' body=' + uploadBodyPreview);
+                          // #region agent log
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:560',message:'UPLOAD_FAIL - returning error',data:{requestId:id,status:uploadStatus,bodyPreview:uploadBodyPreview.substring(0,100)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                          // #endregion
                           resolveOnce({ success: false, error: 'Failed to upload image: ' + uploadStatus, stage: 'upload' });
                           return;
                         }
 
                         // Step 2.5: Verify upload by checking if object exists in Storage using HTTP LIST API
                         console.log('[NativeUploader] Verifying upload in storage...');
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:566',message:'VERIFY_START',data:{requestId:id,bucket:bucket,path:bucketRelativePath},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+                        // #endregion
                         try {
                           var lastSlash = bucketRelativePath.lastIndexOf('/');
                           var folder = lastSlash >= 0 ? bucketRelativePath.substring(0, lastSlash) : '';
@@ -602,19 +753,31 @@ import Capacitor
 
                           var matches = (listData && Array.isArray(listData)) ? listData.length : 0;
                           console.log('VERIFY_OK matches=' + matches);
+                          // #region agent log
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:603',message:'VERIFY_OK - proceeding to finalize',data:{requestId:id,matches:matches},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+                          // #endregion
 
                           if (matches === 0) {
                             console.error('VERIFY_FAIL matches=0');
+                            // #region agent log
+                            fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:607',message:'VERIFY_FAIL matches=0 - returning error',data:{requestId:id,matches:matches},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+                            // #endregion
                             resolveOnce({ success: false, error: 'Upload verification failed: file not found in storage', stage: 'verify' });
                             return;
                           }
                         } catch (verifyError) {
                           console.error('[NativeUploader] Verification error:', verifyError);
+                          // #region agent log
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:612',message:'VERIFY_FAIL exception - returning error',data:{requestId:id,error:verifyError.message || String(verifyError)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+                          // #endregion
                           resolveOnce({ success: false, error: 'Upload verification failed: ' + (verifyError.message || 'Unknown error'), stage: 'verify' });
                           return;
                         }
                         
                         // Step 3: Finalize (POST to Supabase Edge Function) with retry logic
+                        // #region agent log
+                        fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:617',message:'FINALIZE_PREPARE - building payload',data:{requestId:id,fortuneId:fortuneId,bucket:bucket,path:bucketRelativePath,hasToken:!!supabaseToken,hasAnonKey:!!supabaseAnonKey},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                        // #endregion
                         // Backend expects: fortune_id, bucket, path (bucket-relative, NO "photos/" prefix)
                         var finalizePayload = {
                           fortune_id: fortuneId,
@@ -634,6 +797,9 @@ import Capacitor
                         for (var retryAttempt = 0; retryAttempt < maxFinalizeRetries; retryAttempt++) {
                           try {
                             console.log('[NativeUploader] FINALIZE_START attempt=' + (retryAttempt + 1) + '/' + maxFinalizeRetries + ' path=' + bucketRelativePath);
+                            // #region agent log
+                            fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:634',message:'FINALIZE_START attempt',data:{requestId:id,attempt:retryAttempt+1,maxRetries:maxFinalizeRetries,url:supabaseUrl + '/functions/v1/finalize-fortune-photo',hasToken:!!supabaseToken,hasAnonKey:!!supabaseAnonKey},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                            // #endregion
                             
                             var finalizeHeaders = { 'Content-Type': 'application/json' };
                             if (supabaseToken) {
@@ -642,6 +808,10 @@ import Capacitor
                             if (supabaseAnonKey) {
                               finalizeHeaders['apikey'] = supabaseAnonKey;
                             }
+                            
+                            // #region agent log
+                            fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:646',message:'FINALIZE_FETCH - calling endpoint',data:{requestId:id,url:supabaseUrl + '/functions/v1/finalize-fortune-photo',payload:JSON.stringify(finalizePayload).substring(0,200)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                            // #endregion
                             
                             var finalizeResponse = await fetch(supabaseUrl + '/functions/v1/finalize-fortune-photo', {
                               method: 'POST',
@@ -667,10 +837,16 @@ import Capacitor
                               }
                               var signedUrl = finalizeData.signedUrl || '';
                               console.log('FINALIZE_OK status=' + finalizeStatus + ' signedUrl=' + (signedUrl.length > 80 ? signedUrl.substring(0, 80) + '...' : signedUrl) + ' body=' + finalizeResponsePreview);
+                              // #region agent log
+                              fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:662',message:'FINALIZE_OK - success',data:{requestId:id,status:finalizeStatus,hasSignedUrl:!!signedUrl},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                              // #endregion
                               finalizeSuccess = true;
                               break; // Success, exit retry loop
                             } else {
                               console.error('FINALIZE_FAIL status=' + finalizeStatus + ' body=' + finalizeResponsePreview);
+                              // #region agent log
+                              fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:673',message:'FINALIZE_FAIL status',data:{requestId:id,status:finalizeStatus,bodyPreview:finalizeResponsePreview.substring(0,100),isLastAttempt:retryAttempt === maxFinalizeRetries - 1},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                              // #endregion
                               
                               // If this is the last attempt, return error
                               if (retryAttempt === maxFinalizeRetries - 1) {
@@ -760,10 +936,18 @@ import Capacitor
                       resolveOnce({ success: false, error: 'Camera plugin not available' });
                     }
                   } catch (e) {
+                    window.__nativeUploadActive = false; // Clear busy flag on error
                     // #region agent log
                     fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:442',message:'Outer catch - general error',data:{requestId:id,errorType:typeof e,errorMessage:e.message || String(e) || 'no message',hasMessage:!!e.message,errorString:String(e)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B,E'})}).catch(()=>{});
                     // #endregion
                     
+                    // Ensure errors are never swallowed - log to Xcode with stage
+                    var errorStage = 'unknown';
+                    var errorMessage = e.message || String(e) || 'Unknown error';
+                    console.error('[NATIVE-UPLOADER][INJECTED] ERROR caught (stage=' + errorStage + '):', errorMessage);
+                    if (typeof window.__nativeLogToXcode === 'function') {
+                      window.__nativeLogToXcode('ERROR stage=' + errorStage + ' message=' + errorMessage.substring(0, 200));
+                    }
                     console.error('[NativeUploader] Error:', e);
                     // Do NOT treat general errors as cancellation
                     // Only cancel if explicitly requested or null result
@@ -814,6 +998,27 @@ import Capacitor
                     print("\(NativeUploaderBridge.TAG): Failed to inject JavaScript: \(error.localizedDescription)")
                 } else {
                     print("\(NativeUploaderBridge.TAG): JavaScript injected successfully")
+                    
+                    // Verify what implementation is installed
+                    let verifyJS = """
+                        (function() {
+                            var hasNativeUploader = !!window.NativeUploader;
+                            var impl = (window.NativeUploader && window.NativeUploader.__impl) || null;
+                            return JSON.stringify({ hasNativeUploader: hasNativeUploader, impl: impl });
+                        })();
+                    """
+                    
+                    webView.evaluateJavaScript(verifyJS) { result, error in
+                        if let resultString = result as? String,
+                           let data = resultString.data(using: .utf8),
+                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                            let hasNativeUploader = json["hasNativeUploader"] as? Bool ?? false
+                            let impl = json["impl"] as? String
+                            print("\(NativeUploaderBridge.TAG): [NATIVE-UPLOADER][NATIVE] web impl detected: hasNativeUploader=\(hasNativeUploader), impl=\(impl ?? "none")")
+                        } else {
+                            print("\(NativeUploaderBridge.TAG): [NATIVE-UPLOADER][NATIVE] could not verify implementation")
+                        }
+                    }
                 }
             }
         }
