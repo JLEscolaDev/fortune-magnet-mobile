@@ -656,13 +656,42 @@ import Capacitor
                         
                         console.log('TICKET_OK bucketRelativePath=' + bucketRelativePath);
                         
-                        // Step 2: Upload to Supabase signed upload URL via POST multipart/form-data
-                        // Use FormData so Content-Type with boundary is set automatically by fetch
-                        var formData = new FormData();
-                        formData.append(formFieldName, imageBlob, 'photo.jpg');
+                        // Step 2: Upload to Supabase signed upload URL
+                        // Check uploadMethod from ticket: 'PUT' uses raw bytes, 'POST_MULTIPART' uses FormData (legacy)
                         
-                        // Build upload headers from ticket (use requiredHeaders, do NOT set Content-Type - fetch will set it automatically with boundary)
+                        // Helper function to detect MIME type from bytes
+                        function getMimeTypeFromBytes(bytes) {
+                          if (bytes.length < 4) return 'image/jpeg';
+                          var byte0 = bytes[0];
+                          var byte1 = bytes[1];
+                          var byte2 = bytes[2];
+                          var byte3 = bytes[3];
+                          
+                          // JPEG: FF D8 FF
+                          if (byte0 === 0xFF && byte1 === 0xD8 && byte2 === 0xFF) {
+                            return 'image/jpeg';
+                          }
+                          // PNG: 89 50 4E 47
+                          if (byte0 === 0x89 && byte1 === 0x50 && byte2 === 0x4E && byte3 === 0x47) {
+                            return 'image/png';
+                          }
+                          // WebP: RIFF (52 49 46 46)
+                          if (byte0 === 0x52 && byte1 === 0x49 && byte2 === 0x46 && byte3 === 0x46) {
+                            return 'image/webp';
+                          }
+                          return 'image/jpeg'; // fallback
+                        }
+                        
+                        // Detect MIME type from image bytes
+                        var detectedMimeType = getMimeTypeFromBytes(imageBytes);
+                        
+                        // Normalize uploadMethod to uppercase for comparison
+                        var normalizedUploadMethod = (uploadMethod || 'POST_MULTIPART').toUpperCase();
+                        
+                        var uploadResponse;
                         var uploadHeaders = {};
+                        
+                        // Build headers from ticket
                         if (requiredHeaders && typeof requiredHeaders === 'object') {
                           for (var key in requiredHeaders) {
                             if (Object.prototype.hasOwnProperty.call(requiredHeaders, key)) {
@@ -670,18 +699,39 @@ import Capacitor
                             }
                           }
                         }
-                        // Ensure x-upsert default if not in ticket
-                        if (!uploadHeaders['x-upsert']) {
-                          uploadHeaders['x-upsert'] = 'true';
-                        }
-                        // DO NOT set Content-Type - fetch will set it automatically with boundary when using FormData
                         
-                        console.log('[NativeUploader] UPLOAD_START method=POST path=' + bucketRelativePath + ' field=' + formFieldName + ' headers=' + JSON.stringify(uploadHeaders));
-                        var uploadResponse = await fetch(uploadUrl, {
-                          method: 'POST',
-                          headers: uploadHeaders,
-                          body: formData
-                        });
+                        if (normalizedUploadMethod === 'PUT') {
+                          // NEW: Use PUT with raw image bytes (required for signed URLs with token)
+                          console.log('[NATIVE-UPLOADER] upload PUT: ' + uploadUrl.substring(0, 100));
+                          console.log('[NativeUploader] UPLOAD_START method=PUT path=' + bucketRelativePath + ' mime=' + detectedMimeType + ' headers=' + JSON.stringify(uploadHeaders));
+                          
+                          // PUT requires Content-Type header
+                          uploadHeaders['Content-Type'] = detectedMimeType;
+                          
+                          uploadResponse = await fetch(uploadUrl, {
+                            method: 'PUT',
+                            headers: uploadHeaders,
+                            body: imageBytes  // Raw Uint8Array, NOT FormData
+                          });
+                        } else {
+                          // LEGACY: Use POST with multipart/form-data (for backwards compatibility)
+                          console.log('[NativeUploader] UPLOAD_START method=POST path=' + bucketRelativePath + ' field=' + formFieldName + ' headers=' + JSON.stringify(uploadHeaders));
+                          
+                          // Ensure x-upsert default if not in ticket
+                          if (!uploadHeaders['x-upsert']) {
+                            uploadHeaders['x-upsert'] = 'true';
+                          }
+                          
+                          // DO NOT set Content-Type - fetch will set it automatically with boundary when using FormData
+                          var formData = new FormData();
+                          formData.append(formFieldName, imageBlob, 'photo.jpg');
+                          
+                          uploadResponse = await fetch(uploadUrl, {
+                            method: 'POST',
+                            headers: uploadHeaders,  // NO Content-Type here, fetch adds boundary
+                            body: formData
+                          });
+                        }
 
                         var uploadStatus = uploadResponse.status;
                         var uploadResponseText = '';
@@ -696,15 +746,19 @@ import Capacitor
                           uploadBodyPreview = uploadBodyPreview.substring(0, 300);
                         }
 
+                        var actualMethod = normalizedUploadMethod === 'PUT' ? 'PUT' : 'POST';
+                        
                         if (uploadStatus === 200 || uploadStatus === 201 || uploadStatus === 204) {
-                          console.log('UPLOAD_OK status=' + uploadStatus + ' body=' + uploadBodyPreview);
+                          console.log('[NATIVE-UPLOADER] upload success');
+                          console.log('UPLOAD_OK status=' + uploadStatus + ' method=' + actualMethod + ' body=' + uploadBodyPreview);
                           // #region agent log
-                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:557',message:'UPLOAD_OK - proceeding to verify',data:{requestId:id,status:uploadStatus,bodyPreview:uploadBodyPreview.substring(0,100)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:557',message:'UPLOAD_OK - proceeding to verify',data:{requestId:id,status:uploadStatus,method:actualMethod,bodyPreview:uploadBodyPreview.substring(0,100)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
                           // #endregion
                         } else {
-                          console.error('UPLOAD_FAIL status=' + uploadStatus + ' body=' + uploadBodyPreview);
+                          console.error('[NATIVE-UPLOADER] upload failed: ' + uploadBodyPreview);
+                          console.error('UPLOAD_FAIL status=' + uploadStatus + ' method=' + actualMethod + ' body=' + uploadBodyPreview);
                           // #region agent log
-                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:560',message:'UPLOAD_FAIL - returning error',data:{requestId:id,status:uploadStatus,bodyPreview:uploadBodyPreview.substring(0,100)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                          fetch('http://127.0.0.1:7243/ingest/cbd6263e-f536-4878-bd07-b4ffde5dafde',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'NativeUploaderBridge.swift:560',message:'UPLOAD_FAIL - returning error',data:{requestId:id,status:uploadStatus,method:actualMethod,bodyPreview:uploadBodyPreview.substring(0,100)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
                           // #endregion
                           resolveOnce({ success: false, error: 'Failed to upload image: ' + uploadStatus, stage: 'upload' });
                           return;
