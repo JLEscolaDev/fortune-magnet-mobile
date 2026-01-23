@@ -51,7 +51,8 @@ import Capacitor
             
             console.log("[NativePhotoPicker] Initializing simple photo picker bridge");
             
-            // Simple photo picker - only handles picking, not uploading
+            // Simple photo picker - uses Capacitor Camera plugin directly
+            // Returns image bytes to web code, which handles upload via processAndUpload()
             window.NativePhotoPicker = {
               __impl: IMPL_VERSION,
               
@@ -62,6 +63,7 @@ import Capacitor
                   try {
                     // Use Capacitor Camera plugin to pick photo
                     if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
+                      console.error("[NativePhotoPicker] Capacitor Camera plugin not available");
                       reject(new Error('Camera plugin not available'));
                       return;
                     }
@@ -75,22 +77,30 @@ import Capacitor
                       correctOrientation: true
                     });
                     
+                    console.log("[NativePhotoPicker] Camera result received");
+                    
                     // Check if cancelled
-                    if (!cameraResult || (!cameraResult.webPath && !cameraResult.path)) {
+                    if (cameraResult === null || cameraResult === undefined) {
                       console.log("[NativePhotoPicker] User cancelled photo selection");
                       resolve({ cancelled: true });
                       return;
                     }
                     
                     var webPath = cameraResult.webPath || cameraResult.path || '';
+                    if (!webPath) {
+                      console.log("[NativePhotoPicker] No webPath or path in result");
+                      resolve({ cancelled: true });
+                      return;
+                    }
+                    
                     console.log("[NativePhotoPicker] Photo selected, loading from:", webPath.substring(0, 100));
                     
-                    // Load image from URI
+                    // Load image from URI to get bytes
                     var fileResp = await fetch(webPath);
                     var blob = await fileResp.blob();
                     var mimeType = blob.type || 'image/jpeg';
                     var buf = await blob.arrayBuffer();
-                    var bytes = new Uint8Array(buf);
+                    var imageBytes = new Uint8Array(buf);
                     
                     // Get dimensions
                     var width = cameraResult.width || 0;
@@ -101,32 +111,44 @@ import Capacitor
                       var img = new Image();
                       img.src = webPath;
                       await new Promise(function(imgResolve, imgReject) {
-                        img.onload = imgResolve;
-                        img.onerror = imgReject;
-                        setTimeout(imgReject, 5000);
+                        img.onload = function() {
+                          width = img.width;
+                          height = img.height;
+                          imgResolve();
+                        };
+                        img.onerror = function() {
+                          // Still return bytes even if we can't get dimensions
+                          width = 0;
+                          height = 0;
+                          imgResolve();
+                        };
+                        setTimeout(function() {
+                          width = 0;
+                          height = 0;
+                          imgResolve();
+                        }, 5000);
                       });
-                      width = img.width;
-                      height = img.height;
                     }
                     
-                    console.log("[NativePhotoPicker] Photo loaded:", {
-                      mimeType: mimeType,
-                      bytes: bytes.length,
-                      width: width,
-                      height: height
-                    });
-                    
-                    resolve({
-                      bytes: bytes,
+                    var result = {
+                      bytes: imageBytes,
                       mimeType: mimeType,
                       width: width,
                       height: height,
                       cancelled: false
-                    });
+                    };
+                    
+                    console.log("[NativePhotoPicker] Photo converted: " + result.bytes.length + " bytes, " + result.width + "x" + result.height);
+                    resolve(result);
                     
                   } catch (error) {
                     console.error("[NativePhotoPicker] Error picking photo:", error);
-                    if (error && (error.message || String(error)).toLowerCase().indexOf('cancel') !== -1) {
+                    var errorMsg = error && (error.message || String(error)) || 'Unknown error';
+                    var lowerErrorMsg = errorMsg.toLowerCase();
+                    
+                    // Treat camera cancellation as cancelled, not error
+                    if (lowerErrorMsg.indexOf('cancel') !== -1 || lowerErrorMsg.indexOf('cancelled') !== -1) {
+                      console.log("[NativePhotoPicker] Camera error indicates cancellation");
                       resolve({ cancelled: true });
                     } else {
                       reject(error);
@@ -139,7 +161,7 @@ import Capacitor
             // Mark picker as available
             window.NativePhotoPickerAvailable = true;
             
-            console.log("[NativePhotoPicker] Bridge initialized successfully");
+            console.log("[NativePhotoPicker] Bridge initialized - simplified picker ready");
             
           } catch (e) {
             console.error("[NativePhotoPicker] Failed to initialize:", e);
@@ -152,6 +174,7 @@ import Capacitor
             return
         }
         
+        // Inject JavaScript
         webView.evaluateJavaScript(pickerJS) { result, error in
             if let error = error {
                 print("\(NativeUploaderBridge.TAG): Failed to inject photo picker: \(error)")
@@ -1230,3 +1253,4 @@ import Capacitor
         }
     }
 }
+

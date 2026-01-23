@@ -231,26 +231,44 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     
     private func injectSimplePhotoPicker() {
         // Inyecta window.NativePhotoPicker.pickPhoto()
+        // Usa Capacitor Camera plugin directamente en JavaScript
         // Solo maneja selección, retorna bytes + metadata
+        // NO requiere handlers Swift adicionales
     }
     
     private func injectLegacyUploader() {
         // Inyecta window.NativeUploader.pickAndUploadFortunePhoto()
         // Maneja pipeline completo: pick → upload → finalize
+        // Se mantiene para compatibilidad hacia atrás
     }
 }
 ```
 
 **Versión de Implementación**: 
-- `NATIVE_PHOTO_PICKER_VERSION`: Versión del nuevo picker simplificado
-- `NATIVE_UPLOADER_IMPL_VERSION`: Versión del legacy uploader
+- `NATIVE_PHOTO_PICKER_VERSION`: Versión del nuevo picker simplificado (`"ios-picker-v1-2026-01-23"`)
+- `NATIVE_UPLOADER_IMPL_VERSION`: Versión del legacy uploader (`"ios-injected-v3-2026-01-18"`)
 - Si `window.NativeUploader.__impl` o `window.NativePhotoPicker.__impl` ya existen, NO se sobrescriben
 - Esto permite que el código web pueda definir su propia implementación si es necesario
 
 **Cuándo modificar**:
 - **Nuevo picker**: Modificar `injectSimplePhotoPicker()` si necesitas cambiar la lógica de selección
+  - El código JavaScript usa `Capacitor.Plugins.Camera.getPhoto()` directamente
+  - No requiere cambios en Swift nativo
 - **Legacy uploader**: Modificar `injectLegacyUploader()` si necesitas cambiar el pipeline completo
+  - Contiene toda la lógica de upload en JavaScript inyectado
 - **⚠️ Recomendación**: Preferir modificar el código TypeScript de Lovable antes que el legacy uploader
+
+**Diferencias clave entre las dos APIs**:
+
+| Aspecto | NativePhotoPicker (Nuevo) | NativeUploader (Legacy) |
+|---------|---------------------------|-------------------------|
+| **Selección** | Capacitor Camera en JS | Capacitor Camera en JS |
+| **Upload** | Lovable TypeScript (`processAndUpload`) | JavaScript inyectado |
+| **Método HTTP** | PUT (via `uploadToSignedUrl()`) | PUT (corregido recientemente) |
+| **Código Swift** | Solo inyección JS | Solo inyección JS |
+| **Handlers Swift** | No requiere | No requiere |
+| **Mantenibilidad** | Código compartido Web/iOS/Android | Código específico iOS |
+| **Recomendación** | ✅ Usar este | ⚠️ Solo para compatibilidad |
 
 ---
 
@@ -294,35 +312,112 @@ const result = await window.NativePhotoPicker.pickPhoto();
 **Código JavaScript Inyectado**:
 ```javascript
 window.NativePhotoPicker = {
+  __impl: IMPL_VERSION,
+  
   pickPhoto: function() {
+    console.log("[NativePhotoPicker] pickPhoto called");
+    
     return new Promise(async function(resolve, reject) {
-      // 1. Usa Capacitor Camera para seleccionar foto
-      var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
-        quality: 90,
-        allowEditing: false,
-        source: 'PHOTOS',
-        resultType: 'Uri',
-        correctOrientation: true
-      });
-      
-      // 2. Carga la imagen desde webPath
-      var fileResp = await fetch(webPath);
-      var blob = await fileResp.blob();
-      var buf = await blob.arrayBuffer();
-      var bytes = new Uint8Array(buf);
-      
-      // 3. Retorna bytes + metadata
-      resolve({
-        bytes: bytes,
-        mimeType: blob.type || 'image/jpeg',
-        width: width,
-        height: height,
-        cancelled: false
-      });
+      try {
+        // 1. Usa Capacitor Camera plugin para seleccionar foto
+        if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
+          reject(new Error('Camera plugin not available'));
+          return;
+        }
+        
+        console.log("[NativePhotoPicker] Opening photo picker...");
+        var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
+          quality: 90,
+          allowEditing: false,
+          source: 'PHOTOS',
+          resultType: 'Uri',
+          correctOrientation: true
+        });
+        
+        // 2. Verificar si fue cancelado
+        if (cameraResult === null || cameraResult === undefined) {
+          resolve({ cancelled: true });
+          return;
+        }
+        
+        var webPath = cameraResult.webPath || cameraResult.path || '';
+        if (!webPath) {
+          resolve({ cancelled: true });
+          return;
+        }
+        
+        // 3. Carga la imagen desde webPath para obtener bytes
+        var fileResp = await fetch(webPath);
+        var blob = await fileResp.blob();
+        var mimeType = blob.type || 'image/jpeg';
+        var buf = await blob.arrayBuffer();
+        var imageBytes = new Uint8Array(buf);
+        
+        // 4. Obtener dimensiones (del resultado o cargando la imagen)
+        var width = cameraResult.width || 0;
+        var height = cameraResult.height || 0;
+        
+        if (!width || !height) {
+          var img = new Image();
+          img.src = webPath;
+          await new Promise(function(imgResolve) {
+            img.onload = function() {
+              width = img.width;
+              height = img.height;
+              imgResolve();
+            };
+            img.onerror = function() {
+              width = 0;
+              height = 0;
+              imgResolve();
+            };
+            setTimeout(function() {
+              width = 0;
+              height = 0;
+              imgResolve();
+            }, 5000);
+          });
+        }
+        
+        // 5. Retorna bytes + metadata
+        resolve({
+          bytes: imageBytes,
+          mimeType: mimeType,
+          width: width,
+          height: height,
+          cancelled: false
+        });
+        
+      } catch (error) {
+        // Manejar cancelación vs errores reales
+        var errorMsg = error && (error.message || String(error)) || 'Unknown error';
+        if (errorMsg.toLowerCase().indexOf('cancel') !== -1) {
+          resolve({ cancelled: true });
+        } else {
+          reject(error);
+        }
+      }
     });
   }
 };
+
+window.NativePhotoPickerAvailable = true;
 ```
+
+**Características**:
+- ✅ Usa `Capacitor.Plugins.Camera.getPhoto()` directamente (no requiere handlers Swift adicionales)
+- ✅ Maneja cancelación correctamente (retorna `{ cancelled: true }`)
+- ✅ Obtiene dimensiones automáticamente si no están disponibles en el resultado
+- ✅ Convierte la imagen a `Uint8Array` para retornar bytes raw
+- ✅ Detecta MIME type automáticamente desde el blob
+- ✅ Usa `resultType: 'Uri'` para obtener webPath y luego carga los bytes
+- ✅ Maneja errores y los diferencia de cancelaciones
+
+**Ventajas de esta implementación**:
+- **No requiere código Swift adicional**: Todo se maneja en JavaScript usando Capacitor Camera
+- **Más simple**: No necesita message handlers ni delegates
+- **Consistente**: Usa el mismo plugin que el legacy uploader
+- **Mantenible**: Todo el código está en un solo lugar (JavaScript inyectado)
 
 ### Uso en Lovable (TypeScript)
 
@@ -337,40 +432,76 @@ if (window.NativePhotoPickerAvailable && window.NativePhotoPicker) {
   }
   
   // 2. Convertir bytes a File
+  // Uint8Array es compatible directamente con File constructor
+  const extension = pickerResult.mimeType === 'image/png' ? 'png' : 'jpg';
   const file = new File(
-    [pickerResult.bytes],
-    `photo-${Date.now()}.jpg`,
+    [pickerResult.bytes],  // Uint8Array es un BlobPart válido
+    `photo-${Date.now()}.${extension}`,
     { type: pickerResult.mimeType }
   );
   
   // 3. Usar código compartido de Lovable para upload
-  const uploadOptions = {
-    supabaseUrl: 'https://...',
+  const uploadOptions: NativeUploaderOptions = {
+    supabaseUrl: 'https://pegiensgnptpdnfopnoj.supabase.co',
     accessToken: accessToken,
     userId: user.id,
     fortuneId: fortuneId
   };
   
   // processAndUpload usa supabase.storage.uploadToSignedUrl() correctamente
-  await processAndUpload(uploadOptions, file, (result) => {
-    // Manejar resultado
+  // Esto automáticamente usa PUT con raw bytes (correcto para signed URLs)
+  const result = await new Promise<NativeUploaderResult>((resolve) => {
+    processAndUpload(uploadOptions, file, resolve);
   });
+  
+  // Manejar resultado
+  if (result.signedUrl) {
+    setFortunePhoto(result.signedUrl);
+    // ... resto del manejo
+  }
 }
 ```
 
+**Nota sobre Uint8Array**: 
+- `Uint8Array` es directamente compatible con el constructor `File`
+- No necesita conversión adicional - `File` acepta `BlobPart[]` y `Uint8Array` es un `BlobPart` válido
+- El código JavaScript inyectado ya retorna `Uint8Array` correctamente formateado
+
 ### Logs Esperados
 
+**En iOS Console (Xcode)**:
 ```
+[NativePhotoPicker] Initializing simple photo picker bridge
+[NativePhotoPicker] Bridge initialized - simplified picker ready
 [NativePhotoPicker] pickPhoto called
 [NativePhotoPicker] Opening photo picker...
+[NativePhotoPicker] Camera result received
+[NativePhotoPicker] Photo selected, loading from: capacitor://localhost/_capacitor_file_/...
+[NativePhotoPicker] Photo converted: 358336 bytes, 2048x1536
+```
+
+**En Lovable WebView Console**:
+```
+[PHOTO] Using new NativePhotoPicker (simplified flow)
+[NativePhotoPicker] pickPhoto called
+[NativePhotoPicker] Opening photo picker...
+[NativePhotoPicker] Camera result received
 [NativePhotoPicker] Photo selected, loading from: capacitor://...
-[NativePhotoPicker] Photo loaded: { mimeType: "image/jpeg", bytes: 358336, width: 2048, height: 1536 }
-[PHOTO] Using new NativePhotoPicker
-[NATIVE-UPLOADER] STAGE=upload { method: "PUT", hasSignedUploadToken: true }
+[NativePhotoPicker] Photo converted: 358336 bytes, 2048x1536
+[PHOTO] Photo picked: { mimeType: "image/jpeg", bytesLength: 358336, width: 2048, height: 1536 }
+[NATIVE-UPLOADER] STAGE=pick
+[NATIVE-UPLOADER] STAGE=ticket { bucket: "photos", uploadMethod: "PUT" }
+[NATIVE-UPLOADER] STAGE=upload { hasSignedUploadToken: true }
 [NATIVE-UPLOADER] STAGE=upload_ok
 [NATIVE-UPLOADER] STAGE=finalize
 [NATIVE-UPLOADER] STAGE=done
+[PHOTO] Upload result from processAndUpload: { signedUrl: "https://...", replaced: false }
 ```
+
+**Nota**: 
+- Los logs de `[NativePhotoPicker]` vienen del código JavaScript inyectado en iOS
+- Los logs de `[NATIVE-UPLOADER]` vienen del código TypeScript de Lovable (`nativeUploader.ts`)
+- Los logs de `[PHOTO]` vienen de `FortuneModal.tsx`
 
 ---
 
@@ -425,7 +556,129 @@ El código JavaScript inyectado maneja todo el flujo:
 
 ---
 
-## Flujo Completo de Upload
+## Flujo Completo con NativePhotoPicker (Nuevo)
+
+### Paso 1: Detección y Llamada desde Lovable
+
+```typescript
+// En FortuneModal.tsx
+const hasNewPicker = window.NativePhotoPickerAvailable && window.NativePhotoPicker;
+
+if (hasNewPicker) {
+  // Usar nuevo picker simplificado
+  const pickerResult = await window.NativePhotoPicker.pickPhoto();
+}
+```
+
+**Logs esperados**:
+```
+[PHOTO] Using new NativePhotoPicker (simplified flow)
+[NativePhotoPicker] pickPhoto called
+```
+
+### Paso 2: Selección de Foto (JavaScript Inyectado)
+
+El código JavaScript inyectado usa Capacitor Camera:
+
+```javascript
+var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
+  quality: 90,
+  allowEditing: false,
+  source: 'PHOTOS',
+  resultType: 'Uri',
+  correctOrientation: true
+});
+```
+
+**Qué ocurre**:
+1. Capacitor abre el selector nativo de iOS (`UIImagePickerController`)
+2. Usuario selecciona una foto
+3. iOS muestra pantalla de confirmación (comportamiento nativo)
+4. Usuario confirma → Capacitor procesa la foto y retorna `webPath`
+
+**Logs esperados**:
+```
+[NativePhotoPicker] Opening photo picker...
+[NativePhotoPicker] Camera result received
+```
+
+### Paso 3: Conversión a Bytes (JavaScript Inyectado)
+
+```javascript
+// Cargar imagen desde webPath
+var fileResp = await fetch(webPath);
+var blob = await fileResp.blob();
+var buf = await blob.arrayBuffer();
+var imageBytes = new Uint8Array(buf);
+```
+
+**Logs esperados**:
+```
+[NativePhotoPicker] Photo selected, loading from: capacitor://...
+[NativePhotoPicker] Photo converted: 358336 bytes, 2048x1536
+```
+
+### Paso 4: Retorno a Lovable
+
+El JavaScript retorna el resultado a Lovable:
+
+```javascript
+resolve({
+  bytes: imageBytes,        // Uint8Array
+  mimeType: 'image/jpeg',   // Detectado del blob
+  width: 2048,              // Del resultado o cargado
+  height: 1536,              // Del resultado o cargado
+  cancelled: false
+});
+```
+
+**Logs esperados**:
+```
+[PHOTO] Photo picked: { mimeType: "image/jpeg", bytesLength: 358336, width: 2048, height: 1536 }
+```
+
+### Paso 5: Creación de File y Upload (Lovable TypeScript)
+
+```typescript
+// Crear File desde bytes
+const file = new File(
+  [pickerResult.bytes],
+  `photo-${Date.now()}.jpg`,
+  { type: pickerResult.mimeType }
+);
+
+// Usar código compartido de Lovable
+const result = await new Promise((resolve) => {
+  processAndUpload(uploadOptions, file, resolve);
+});
+```
+
+**Qué hace `processAndUpload()`**:
+1. Obtiene ticket del edge function (`issue-fortune-upload-ticket`)
+2. Usa `supabase.storage.uploadToSignedUrl()` con el token
+3. Esto internamente hace **PUT con raw bytes** (correcto)
+4. Llama a `finalize-fortune-photo` para completar
+
+**Logs esperados**:
+```
+[NATIVE-UPLOADER] STAGE=ticket { bucket: "photos", uploadMethod: "PUT" }
+[NATIVE-UPLOADER] STAGE=upload { hasSignedUploadToken: true }
+[NATIVE-UPLOADER] STAGE=upload_ok
+[NATIVE-UPLOADER] STAGE=finalize
+[NATIVE-UPLOADER] STAGE=done
+```
+
+### Ventajas del Nuevo Flujo
+
+1. **Código compartido**: El upload lo maneja Lovable, funciona igual en Web/iOS/Android
+2. **PUT correcto**: `uploadToSignedUrl()` usa PUT automáticamente
+3. **Más simple**: iOS solo maneja la selección, no el upload
+4. **Más fácil de debuggear**: Todo el código de upload está en TypeScript
+5. **Mantenible**: Un solo lugar para cambios de upload
+
+---
+
+## Flujo Completo de Upload (Legacy - NativeUploader)
 
 ### Paso 1: Llamada desde el Código Web
 
