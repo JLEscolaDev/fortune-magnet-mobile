@@ -688,16 +688,30 @@ import Capacitor
                         var detectedMimeType = getMimeTypeFromBytes(imageBytes);
                         
                         // Normalize uploadMethod to uppercase for comparison
-                        // CRITICAL: If uploadMethod is not provided, default to PUT for signed URLs (they require PUT)
-                        // Signed URLs from Supabase Storage have pattern: /storage/v1/object/upload/sign/...
+                        // CRITICAL: Signed URLs from Supabase Storage ALWAYS require PUT, regardless of ticket uploadMethod
+                        // Signed URLs have pattern: /storage/v1/object/upload/sign/...
                         var isSignedUrl = uploadUrl && uploadUrl.indexOf('/upload/sign/') !== -1;
-                        var defaultMethod = isSignedUrl ? 'PUT' : 'POST_MULTIPART';
-                        var normalizedUploadMethod = (uploadMethod || defaultMethod).toUpperCase();
+                        
+                        // FORCE PUT for signed URLs - they don't work with POST multipart
+                        // Even if ticket says POST_MULTIPART, signed URLs require PUT
+                        var finalUploadMethod;
+                        if (isSignedUrl) {
+                          finalUploadMethod = 'PUT';
+                          if (uploadMethod && uploadMethod.toUpperCase() !== 'PUT') {
+                            console.warn('[NATIVE-UPLOADER] ⚠️ WARNING: Ticket specifies uploadMethod=' + uploadMethod + ' but URL is signed URL. Forcing PUT (signed URLs require PUT).');
+                          }
+                        } else {
+                          // For non-signed URLs, use ticket method or default to POST_MULTIPART
+                          var defaultMethod = 'POST_MULTIPART';
+                          finalUploadMethod = (uploadMethod || defaultMethod).toUpperCase();
+                        }
+                        
+                        var normalizedUploadMethod = finalUploadMethod;
                         
                         // Log the decision for debugging
-                        console.log('[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=' + (uploadMethod || 'NOT_PROVIDED') + ', isSignedUrl=' + isSignedUrl + ', normalized=' + normalizedUploadMethod);
+                        console.log('[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=' + (uploadMethod || 'NOT_PROVIDED') + ', isSignedUrl=' + isSignedUrl + ', finalMethod=' + normalizedUploadMethod);
                         if (typeof window !== 'undefined' && window.console) {
-                          window.console.log('[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=' + (uploadMethod || 'NOT_PROVIDED') + ', isSignedUrl=' + isSignedUrl + ', normalized=' + normalizedUploadMethod);
+                          window.console.log('[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=' + (uploadMethod || 'NOT_PROVIDED') + ', isSignedUrl=' + isSignedUrl + ', finalMethod=' + normalizedUploadMethod);
                         }
                         
                         var uploadResponse;

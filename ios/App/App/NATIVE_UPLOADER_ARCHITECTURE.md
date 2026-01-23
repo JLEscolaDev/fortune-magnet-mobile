@@ -485,10 +485,30 @@ var ticketResponse = await fetch(supabaseUrl + '/functions/v1/issue-fortune-uplo
 
 **Cambio crítico**: El código ahora usa **PUT** con bytes raw, NO multipart POST.
 
+**⚠️ FORZADO AUTOMÁTICO DE PUT**: El código **SIEMPRE usa PUT** cuando detecta un signed URL (URLs que contienen `/upload/sign/`), incluso si el ticket especifica `uploadMethod: 'POST_MULTIPART'`. Esto es crítico porque los signed URLs de Supabase Storage **requieren PUT** y no funcionan con POST multipart.
+
+**Lógica de decisión**:
+```javascript
+// Detecta si es signed URL
+var isSignedUrl = uploadUrl && uploadUrl.indexOf('/upload/sign/') !== -1;
+
+// FORCE PUT for signed URLs - they don't work with POST multipart
+var finalUploadMethod;
+if (isSignedUrl) {
+  finalUploadMethod = 'PUT';  // SIEMPRE PUT para signed URLs
+  if (uploadMethod && uploadMethod.toUpperCase() !== 'PUT') {
+    console.warn('⚠️ WARNING: Ticket specifies POST_MULTIPART but URL is signed URL. Forcing PUT.');
+  }
+} else {
+  // Para URLs no-signed, usa el método del ticket o POST_MULTIPART por defecto
+  finalUploadMethod = (uploadMethod || 'POST_MULTIPART').toUpperCase();
+}
+```
+
 **Por qué PUT en lugar de POST**:
 - **PUT es idempotente**: Puedes repetir la misma request sin efectos secundarios
 - **Más simple**: No necesita multipart/form-data, solo envías los bytes raw con Content-Type
-- **Mejor para signed URLs**: Los signed URLs de Storage están diseñados para PUT
+- **Requerido para signed URLs**: Los signed URLs de Supabase Storage con token **requieren PUT** - POST multipart retorna 200 pero no persiste el archivo
 - **Headers más limpios**: Solo necesitas Content-Type, no boundary
 
 **Detección de MIME Type**:
@@ -1212,36 +1232,75 @@ VERIFY_FAIL matches=0
 
 ### Identificar Qué Código Está Ejecutándose
 
-**⚠️ IMPORTANTE**: Puede haber DOS implementaciones diferentes:
+**⚠️ CRÍTICO**: Puede haber DOS implementaciones diferentes ejecutándose. Los logs muestran claramente cuál se está usando.
 
-1. **JavaScript Inyectado (NativeUploaderBridge.swift)**: 
-   - Logs empiezan con `[NATIVE-UPLOADER][INJECTED]` o `[NativeUploader]`
-   - Usa `Capacitor.Plugins.Camera.getPhoto()`
-   - Ejecuta todo el flujo en JavaScript dentro del WebView
+#### 1. JavaScript Inyectado (NativeUploaderBridge.swift)
 
-2. **Código Web de Lovable**:
-   - Logs pueden empezar con `[NATIVE-UPLOADER]` pero sin `[INJECTED]`
-   - Puede tener su propia implementación que sobrescribe `window.NativeUploader`
-   - Puede hacer el upload directamente sin usar el código inyectado
+**Características**:
+- Logs empiezan con `[NATIVE-UPLOADER][INJECTED]` o `[NativeUploader]`
+- Usa `Capacitor.Plugins.Camera.getPhoto()` para seleccionar fotos
+- Ejecuta TODO el flujo en JavaScript dentro del WebView
+- Detecta automáticamente signed URLs y usa PUT
 
-**Cómo identificar qué código se ejecuta**:
-
-**Si ves estos logs, está usando el código INYECTADO**:
+**Logs esperados del código INYECTADO**:
 ```
 [NATIVE-UPLOADER][INJECTED] FUNCTION CALLED - pickAndUploadFortunePhoto entry point
 [NativeUploader] Opening photo picker...
 [NativeUploader] PICKER_OK w=2048 h=1152 bytes=358336
-[NativeUploader] UPLOAD_START method=PUT path=...
+[NATIVE-UPLOADER] ticket: POST https://.../issue-fortune-upload-ticket
+[NATIVE-UPLOADER] ticket: status=200
+[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=PUT, isSignedUrl=true, finalMethod=PUT
+[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=POST_MULTIPART, isSignedUrl=true, finalMethod=PUT  ← ⚠️ Forzado a PUT
+[NATIVE-UPLOADER] upload PUT: https://.../storage/v1/object/upload/sign/...
+[NativeUploader] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg
+[NATIVE-UPLOADER] upload: status=200 method=PUT
 ```
 
-**Si ves estos logs, está usando código de LOVABLE**:
+#### 2. Código Web de Lovable
+
+**Características**:
+- Logs empiezan con `[NATIVE-UPLOADER]` pero **SIN** `[INJECTED]`
+- Tiene su propia implementación que sobrescribe `window.NativeUploader`
+- Puede hacer el upload directamente sin usar el código inyectado
+- **PROBLEMA**: Típicamente usa POST cuando debería usar PUT
+
+**Logs actuales del código de LOVABLE (INCORRECTO)**:
 ```
-[NATIVE-UPLOADER] iOS handler hit (main), reqId=1
-[NATIVE-UPLOADER] processAndUpload: fortuneId=...
+[NATIVE-UPLOADER] iOS handler hit (main), reqId=1  ← ⚠️ Código de Lovable
+[NATIVE-UPLOADER] processAndUpload: fortuneId=...  ← ⚠️ NO es código inyectado
 [NATIVE-UPLOADER] image prepared: 2048x1152 bytes=358336
-[NATIVE-UPLOADER] ticket: POST https://...
-[NATIVE-UPLOADER] upload POST: https://...
+[NATIVE-UPLOADER] ticket: POST https://.../issue-fortune-upload-ticket
+[NATIVE-UPLOADER] ticket: status=200
+[NATIVE-UPLOADER] upload POST: https://.../storage/v1/object/upload/sign/...  ← ⚠️ POST (incorrecto)
+[NATIVE-UPLOADER] upload: status=200  ← Parece exitoso pero...
+[NATIVE-UPLOADER] finalize: status=500  ← ❌ FALLO
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED"...}
 ```
+
+**Cómo identificar rápidamente**:
+
+| Log | Significado |
+|-----|-------------|
+| `[NATIVE-UPLOADER][INJECTED]` | ✅ Código inyectado (correcto) |
+| `[NATIVE-UPLOADER] iOS handler hit` | ⚠️ Código de Lovable (puede tener problemas) |
+| `[NativeUploader] Opening photo picker...` | ✅ Código inyectado |
+| `[NATIVE-UPLOADER] processAndUpload:` | ⚠️ Código de Lovable |
+| `upload PUT:` | ✅ Método correcto |
+| `upload POST:` con `/upload/sign/` | ❌ Método incorrecto para signed URLs |
+
+**Por qué el código inyectado NO se ejecuta cuando Lovable tiene su propio código**:
+
+El código inyectado verifica si ya existe una implementación:
+
+```javascript
+// En NativeUploaderBridge.swift línea ~27
+if (window.NativeUploader && window.NativeUploader.__impl) {
+  console.log("existing implementation detected, skipping install");
+  return; // NO sobrescribe
+}
+```
+
+Si Lovable define `window.NativeUploader.pickAndUploadFortunePhoto` ANTES de que se inyecte el código, o si define `window.NativeUploader.__impl`, el código inyectado NO se ejecutará.
 
 **Si Lovable tiene su propia implementación**:
 - El código web puede haber definido `window.NativeUploader.pickAndUploadFortunePhoto` antes de que se inyecte el código
@@ -1611,21 +1670,31 @@ if (headResponse.status === 200) {
 
 ### Resumen Ejecutivo para Lovable
 
-**Problema más común**: `UPLOAD_NOT_PERSISTED` - El upload retorna 200 pero el archivo no se guarda.
+**⚠️ PROBLEMA CRÍTICO IDENTIFICADO**: Los logs muestran que Lovable tiene su propio código ejecutándose que NO respeta PUT.
 
-**Causa raíz**: Se está usando **POST multipart** cuando el signed URL requiere **PUT con raw bytes**.
+**Evidencia de los logs**:
+```
+[NATIVE-UPLOADER] iOS handler hit (main), reqId=1  ← Código de Lovable ejecutándose
+[NATIVE-UPLOADER] processAndUpload: fortuneId=...  ← NO es código inyectado
+[NATIVE-UPLOADER] upload POST: https://.../upload/sign/...  ← ⚠️ Usa POST (incorrecto)
+[NATIVE-UPLOADER] upload: status=200  ← Parece exitoso pero...
+[NATIVE-UPLOADER] finalize: status=500  ← FALLO
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED"...}  ← Archivo no encontrado
+```
 
-**Cómo identificar**:
-1. Busca en los logs: `[NATIVE-UPLOADER] upload POST:` ← ⚠️ Incorrecto
-2. Debe decir: `[NATIVE-UPLOADER] upload PUT:` ← ✅ Correcto
-3. Busca: `UPLOAD_START method=POST` ← ⚠️ Incorrecto
-4. Debe decir: `UPLOAD_START method=PUT` ← ✅ Correcto
+**Causa raíz**: 
+- Lovable tiene código propio que sobrescribe el código inyectado
+- Ese código usa **POST multipart** cuando el signed URL requiere **PUT con raw bytes**
+- La URL contiene `/upload/sign/` que es un signed URL de Supabase Storage que **SIEMPRE requiere PUT**
 
-**Solución rápida**:
-1. Verifica que el ticket incluya `uploadMethod: 'PUT'`
-2. Modifica el código de upload para usar PUT cuando `uploadMethod === 'PUT'`
-3. Envía raw bytes (`Uint8Array`) en el body, NO `FormData`
-4. Añade header `Content-Type` con el MIME type detectado
+**Solución inmediata para Lovable**:
+
+1. **Buscar en el código de Lovable** donde se hace el upload (buscar `upload POST` o `fetch(uploadUrl`)
+2. **Reemplazar POST por PUT** cuando la URL contiene `/upload/sign/`
+3. **Cambiar FormData por raw bytes** (`Uint8Array`)
+4. **Añadir header Content-Type** con el MIME type
+
+**Código completo para copiar y pegar**: Ver sección [Solución Completa para Lovable](#solución-completa-para-lovable-código-de-ejemplo)
 
 **Ver sección completa**: [Problema: UPLOAD_NOT_PERSISTED](#problema-upload_not_persisted)
 
@@ -1758,6 +1827,8 @@ path: 'userId/file.jpg'  // bucket-relative
 <a id="problema-upload_not_persisted"></a>
 ### Problema: `UPLOAD_NOT_PERSISTED` - El archivo no se encuentra después del upload
 
+**⚠️ ESTE ES EL PROBLEMA MÁS COMÚN Y CRÍTICO**
+
 **Síntoma**:
 ```
 [NATIVE-UPLOADER] upload: status=200
@@ -1793,62 +1864,394 @@ Este error significa que:
    - El edge function debe retornar `uploadMethod: 'PUT'`
    - El código debe leer este valor y usarlo
 
-**Solución según el código que se ejecuta**:
+**⚠️ DIAGNÓSTICO CRÍTICO**: Los logs muestran que **Lovable tiene su propio código ejecutándose**, NO el código inyectado.
 
-#### Si usa código INYECTADO (NativeUploaderBridge.swift):
+**Evidencia en los logs**:
+- `[NATIVE-UPLOADER] iOS handler hit (main), reqId=1` ← **Código de Lovable**
+- `[NATIVE-UPLOADER] processAndUpload:` ← **NO es código inyectado**
+- `[NATIVE-UPLOADER] upload POST:` ← **Usa POST (incorrecto)**
 
-1. Verifica que el ticket incluya `uploadMethod: 'PUT'`:
-   ```json
-   {
-     "url": "https://...",
-     "bucketRelativePath": "userId/file.jpg",
-     "uploadMethod": "PUT"  ← DEBE estar presente
-   }
+**Si ves estos logs, el código inyectado NO se está ejecutando**. Lovable tiene su propia implementación que está sobrescribiendo el código inyectado.
+
+---
+
+### Opción 1: Usar el Código Inyectado (Recomendado - Más Simple)
+
+**El código inyectado ya tiene toda la lógica correcta**. Para asegurar que se ejecute:
+
+1. **Buscar y eliminar código de Lovable**: 
+   - Busca cualquier definición de `window.NativeUploader` en el código de Lovable
+   - Busca funciones como `processAndUpload` o `upload` relacionadas con fotos
+   - Elimina o comenta estas definiciones
+
+2. **Verificar que no hay `__impl` definido**: 
+   - El código inyectado NO sobrescribe si detecta `window.NativeUploader.__impl`
+   - Asegúrate de que Lovable NO defina `window.NativeUploader.__impl`
+
+3. **Verificar orden de ejecución**: 
+   - El código inyectado se ejecuta al iniciar la app (0.5s después de launch)
+   - Si Lovable define `window.NativeUploader` después, puede sobrescribir
+   - Asegúrate de que Lovable NO defina nada en `window.NativeUploader` después del bootstrap
+
+4. **Verificar logs después de reiniciar la app**:
    ```
-
-2. Verifica que el código respete `uploadMethod`:
-   - Busca en `NativeUploaderBridge.swift` líneas ~659-735
-   - Debe haber lógica que verifica `if (normalizedUploadMethod === 'PUT')`
-   - Si falta esta lógica, añádela (ver sección "Cómo Modificar el Código")
-
-3. Verifica los logs muestran PUT:
+   NativeUploaderBridge: JavaScript bridge injected
+   [NATIVE-UPLOADER][INJECTED] installed ios-injected-v3-2026-01-18
    ```
+   Si ves estos logs, el código inyectado está activo.
+
+5. **Verificar que se ejecuta al hacer upload**:
+   ```
+   [NATIVE-UPLOADER][INJECTED] FUNCTION CALLED - pickAndUploadFortunePhoto entry point
+   [NativeUploader] Opening photo picker...
+   [NATIVE-UPLOADER] uploadMethod decision: ticketMethod=PUT, isSignedUrl=true, finalMethod=PUT
+[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=POST_MULTIPART, isSignedUrl=true, finalMethod=PUT  ← ⚠️ Forzado a PUT
    [NATIVE-UPLOADER] upload PUT: https://...
-   [NativeUploader] UPLOAD_START method=PUT path=... mime=image/jpeg
    ```
 
-#### Si usa código de LOVABLE:
+**Ventajas de usar el código inyectado**:
+- ✅ Ya tiene toda la lógica correcta implementada
+- ✅ Detecta automáticamente signed URLs y usa PUT
+- ✅ Maneja todos los edge cases
+- ✅ Tiene logging completo para debugging
+- ✅ No requiere cambios en Lovable
 
-1. El código web de Lovable debe:
-   - Leer `uploadMethod` del ticket response
-   - Usar PUT cuando `uploadMethod === 'PUT'`
-   - Enviar raw bytes (`Uint8Array`) en el body, NO `FormData`
+---
 
-2. Ejemplo de código correcto en Lovable:
+### Opción 2: Corregir el Código de Lovable (Si Necesitas Mantenerlo)
+
+Si por alguna razón necesitas mantener el código de Lovable, debes corregirlo para usar PUT.
+
+## Solución Completa para Lovable - Código de Ejemplo
+
+### Paso 1: Identificar Dónde Está el Código de Upload en Lovable
+
+**Los logs muestran estos patrones que indican código de Lovable**:
+- `[NATIVE-UPLOADER] iOS handler hit`
+- `[NATIVE-UPLOADER] processAndUpload:`
+- `[NATIVE-UPLOADER] upload POST:` (cuando debería ser PUT)
+
+**Busca en el código de Lovable por estos términos**:
+
+1. **Buscar por logs específicos**:
    ```javascript
-   const ticket = await fetch('/functions/v1/issue-fortune-upload-ticket', {...});
-   const ticketData = await ticket.json();
-   
-   const uploadMethod = ticketData.uploadMethod || 'POST_MULTIPART';
-   
-   if (uploadMethod === 'PUT') {
-     // PUT con raw bytes
-     await fetch(ticketData.url, {
-       method: 'PUT',
-       headers: {
-         'Content-Type': mimeType  // image/jpeg, image/png, etc.
-       },
-       body: imageBytes  // Uint8Array, NO FormData
-     });
-   } else {
-     // POST multipart (legacy)
-     const formData = new FormData();
-     formData.append('file', imageBlob);
-     await fetch(ticketData.url, {
-       method: 'POST',
-       body: formData
-     });
-   }
+   // Busca código que loguee estos mensajes:
+   console.log('[NATIVE-UPLOADER] iOS handler hit');
+   console.log('[NATIVE-UPLOADER] processAndUpload:');
+   console.log('[NATIVE-UPLOADER] upload POST:');
+   ```
+
+2. **Buscar por funciones**:
+   ```javascript
+   // Busca funciones con estos nombres:
+   function processAndUpload(...)
+   async function processAndUpload(...)
+   const processAndUpload = (...)
+   ```
+
+3. **Buscar por fetch con uploadUrl**:
+   ```javascript
+   // Busca código que haga fetch al uploadUrl:
+   fetch(uploadUrl, { method: 'POST', ... })
+   fetch(ticketData.url, { method: 'POST', ... })
+   ```
+
+4. **Buscar por FormData en contexto de upload**:
+   ```javascript
+   // Busca código que use FormData para uploads:
+   const formData = new FormData();
+   formData.append('file', ...);
+   fetch(uploadUrl, { method: 'POST', body: formData })
+   ```
+
+5. **Buscar definiciones de window.NativeUploader**:
+   ```javascript
+   // Busca código que defina:
+   window.NativeUploader = { ... }
+   window.NativeUploader.pickAndUploadFortunePhoto = function(...) { ... }
+   ```
+
+**Ubicaciones comunes en Lovable**:
+- Archivos relacionados con "upload", "photo", "image"
+- Componentes de formularios que manejan fotos
+- Utilidades o helpers de upload
+- Archivos que manejan la integración con Supabase Storage
+
+### Paso 2: Código Correcto para Lovable
+
+**Reemplaza TODO el código de upload con esto**:
+
+```javascript
+// DESPUÉS de obtener el ticket:
+const ticketResponse = await fetch(supabaseUrl + '/functions/v1/issue-fortune-upload-ticket', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer ' + supabaseToken,
+    'apikey': supabaseAnonKey
+  },
+  body: JSON.stringify({
+    fortune_id: fortuneId,
+    mime: mimeType
+  })
+});
+
+const ticketData = await ticketResponse.json();
+
+// CRÍTICO: Detectar si es signed URL (siempre requiere PUT)
+const uploadUrl = ticketData.url;
+const isSignedUrl = uploadUrl && uploadUrl.indexOf('/upload/sign/') !== -1;
+
+// CRÍTICO: Leer uploadMethod del ticket, o detectar automáticamente
+const ticketUploadMethod = ticketData.uploadMethod;
+const shouldUsePut = ticketUploadMethod === 'PUT' || isSignedUrl;
+
+// Detectar MIME type desde los bytes de la imagen
+function getMimeTypeFromBytes(bytes) {
+  if (bytes.length < 4) return 'image/jpeg';
+  const byte0 = bytes[0];
+  const byte1 = bytes[1];
+  const byte2 = bytes[2];
+  const byte3 = bytes[3];
+  
+  // JPEG: FF D8 FF
+  if (byte0 === 0xFF && byte1 === 0xD8 && byte2 === 0xFF) {
+    return 'image/jpeg';
+  }
+  // PNG: 89 50 4E 47
+  if (byte0 === 0x89 && byte1 === 0x50 && byte2 === 0x4E && byte3 === 0x47) {
+    return 'image/png';
+  }
+  // WebP: RIFF (52 49 46 46)
+  if (byte0 === 0x52 && byte1 === 0x49 && byte2 === 0x46 && byte3 === 0x46) {
+    return 'image/webp';
+  }
+  return 'image/jpeg'; // fallback
+}
+
+const detectedMimeType = getMimeTypeFromBytes(imageBytes);
+
+// Logging para debugging
+console.log('[NATIVE-UPLOADER] uploadMethod decision:', {
+  ticketMethod: ticketUploadMethod || 'NOT_PROVIDED',
+  isSignedUrl: isSignedUrl,
+  shouldUsePut: shouldUsePut,
+  uploadUrl: uploadUrl.substring(0, 100)
+});
+
+let uploadResponse;
+
+if (shouldUsePut) {
+  // ✅ PUT con raw bytes (REQUERIDO para signed URLs)
+  console.log('[NATIVE-UPLOADER] upload PUT: ' + uploadUrl.substring(0, 100));
+  console.log('[NATIVE-UPLOADER] UPLOAD_START method=PUT path=' + ticketData.bucketRelativePath + ' mime=' + detectedMimeType + ' bytes=' + imageBytes.length);
+  
+  uploadResponse = await fetch(uploadUrl, {
+    method: 'PUT',  // CRÍTICO: PUT, no POST
+    headers: {
+      'Content-Type': detectedMimeType,  // image/jpeg, image/png, etc.
+      // Añade headers adicionales del ticket si los hay
+      ...(ticketData.requiredHeaders || {})
+    },
+    body: imageBytes  // CRÍTICO: Uint8Array raw bytes, NO FormData
+  });
+} else {
+  // ⚠️ POST multipart (solo para URLs legacy que no son signed URLs)
+  console.log('[NATIVE-UPLOADER] upload POST: ' + uploadUrl.substring(0, 100));
+  console.log('[NATIVE-UPLOADER] UPLOAD_START method=POST path=' + ticketData.bucketRelativePath);
+  
+  const formData = new FormData();
+  formData.append(ticketData.formFieldName || 'file', imageBlob, 'photo.jpg');
+  
+  const uploadHeaders = {
+    'x-upsert': 'true',
+    ...(ticketData.requiredHeaders || {})
+  };
+  // NO incluir Content-Type - fetch lo añade automáticamente con boundary
+  
+  uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: uploadHeaders,
+    body: formData
+  });
+}
+
+const uploadStatus = uploadResponse.status;
+const uploadResponseText = await uploadResponse.text();
+
+if (uploadStatus === 200 || uploadStatus === 201 || uploadStatus === 204) {
+  console.log('[NATIVE-UPLOADER] upload: status=' + uploadStatus + ' method=' + (shouldUsePut ? 'PUT' : 'POST'));
+  console.log('[NATIVE-UPLOADER] upload success');
+} else {
+  console.error('[NATIVE-UPLOADER] upload: status=' + uploadStatus);
+  console.error('[NATIVE-UPLOADER] upload failed: ' + uploadResponseText);
+  throw new Error('Upload failed: ' + uploadStatus);
+}
+```
+
+### Paso 3: Verificación Post-Cambio
+
+Después de aplicar el cambio, los logs deben mostrar:
+
+**✅ CORRECTO**:
+```
+[NATIVE-UPLOADER] uploadMethod decision: {ticketMethod: "PUT", isSignedUrl: true, shouldUsePut: true, ...}
+[NATIVE-UPLOADER] upload PUT: https://.../storage/v1/object/upload/sign/...
+[NATIVE-UPLOADER] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg bytes=358336
+[NATIVE-UPLOADER] upload: status=200 method=PUT
+[NATIVE-UPLOADER] upload success
+[NATIVE-UPLOADER] finalize: status=200  ← ✅ Debe ser 200, no 500
+```
+
+**❌ INCORRECTO (lo que está pasando ahora)**:
+```
+[NATIVE-UPLOADER] upload POST: https://.../storage/v1/object/upload/sign/...
+[NATIVE-UPLOADER] upload: status=200 method=POST
+[NATIVE-UPLOADER] finalize: status=500  ← ❌ FALLO
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED"...}
+```
+
+### Paso 4: Variables Requeridas
+
+Asegúrate de que estas variables existan en el scope:
+
+- `imageBytes`: `Uint8Array` con los bytes de la imagen
+- `imageBlob`: `Blob` de la imagen (para POST legacy)
+- `mimeType`: String como `'image/jpeg'` o `'image/png'`
+- `ticketData`: Objeto con la respuesta del ticket
+- `supabaseToken`: Token de acceso de Supabase
+- `supabaseAnonKey`: Anon key de Supabase
+- `supabaseUrl`: URL de Supabase
+
+### Paso 5: Verificación Final
+
+Después de aplicar el cambio, verifica los logs:
+
+**✅ CORRECTO (debe aparecer así)**:
+```
+[NATIVE-UPLOADER] uploadMethod decision: {ticketMethod: "PUT", isSignedUrl: true, shouldUsePut: true, ...}
+[NATIVE-UPLOADER] upload PUT: https://.../storage/v1/object/upload/sign/...
+[NATIVE-UPLOADER] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg bytes=358336
+[NATIVE-UPLOADER] upload: status=200 method=PUT
+[NATIVE-UPLOADER] upload success
+[NATIVE-UPLOADER] finalize: status=200  ← ✅ Debe ser 200, no 500
+[NATIVE-UPLOADER] finalize: body={"signedUrl":"https://...","replaced":false}  ← ✅ Éxito
+```
+
+**❌ INCORRECTO (lo que está pasando ahora)**:
+```
+[NATIVE-UPLOADER] upload POST: https://.../storage/v1/object/upload/sign/...  ← ⚠️ POST (incorrecto)
+[NATIVE-UPLOADER] upload: status=200 method=POST  ← Parece exitoso pero...
+[NATIVE-UPLOADER] finalize: status=500  ← ❌ FALLO
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED"...}  ← Archivo no encontrado
+```
+
+### Resumen: Qué Hacer Según los Logs
+
+**Si ves `[NATIVE-UPLOADER] iOS handler hit`**:
+- ✅ Lovable tiene su propio código ejecutándose
+- ✅ Usa la Opción 2: Corregir el código de Lovable (arriba)
+- ✅ O usa la Opción 1: Eliminar código de Lovable y usar el inyectado
+
+**Si ves `[NATIVE-UPLOADER][INJECTED] FUNCTION CALLED`**:
+- ✅ El código inyectado se está ejecutando
+- ✅ Debería funcionar correctamente
+- ✅ Si aún falla, verifica que el ticket incluya `uploadMethod: 'PUT'`
+
+**Si ves `upload POST:` con URL que contiene `/upload/sign/`**:
+- ❌ **PROBLEMA CRÍTICO**: Está usando POST cuando debe usar PUT
+- ✅ Corrige el código para usar PUT cuando detecte `/upload/sign/`
+- ✅ O elimina el código de Lovable y usa el inyectado
+
+---
+
+## Checklist de Acción para Lovable (Basado en Logs Reales)
+
+### ✅ Paso 1: Confirmar el Problema
+
+Basado en los logs proporcionados, confirma que ves:
+- [ ] `[NATIVE-UPLOADER] iOS handler hit (main), reqId=1`
+- [ ] `[NATIVE-UPLOADER] processAndUpload: fortuneId=...`
+- [ ] `[NATIVE-UPLOADER] upload POST: https://.../storage/v1/object/upload/sign/...`
+- [ ] `[NATIVE-UPLOADER] upload: status=200`
+- [ ] `[NATIVE-UPLOADER] finalize: status=500`
+- [ ] `[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED"...}`
+
+**Si TODOS estos están presentes**: Lovable tiene código propio que usa POST incorrectamente.
+
+### ✅ Paso 2: Decidir Estrategia
+
+**Opción A: Usar código inyectado (Recomendado)**
+- [ ] Buscar y eliminar código de Lovable que define `window.NativeUploader`
+- [ ] Buscar y eliminar funciones `processAndUpload` en Lovable
+- [ ] Verificar que no hay `window.NativeUploader.__impl` definido
+- [ ] Reiniciar la app y verificar logs muestran `[NATIVE-UPLOADER][INJECTED]`
+
+**Opción B: Corregir código de Lovable**
+- [ ] Encontrar el código que hace `fetch(uploadUrl, { method: 'POST' })`
+- [ ] Reemplazar con el código de ejemplo completo de arriba
+- [ ] Asegurar que detecta `/upload/sign/` y usa PUT automáticamente
+- [ ] Añadir logging para verificar qué método se usa
+
+### ✅ Paso 3: Aplicar el Cambio
+
+**Si eliges Opción A (código inyectado)**:
+1. Elimina código de Lovable relacionado con uploads nativos
+2. Reinicia la app completamente
+3. Verifica logs: debe aparecer `[NATIVE-UPLOADER][INJECTED]`
+
+**Si eliges Opción B (corregir Lovable)**:
+1. Copia el código completo del "Paso 2: Código Correcto para Lovable" arriba
+2. Reemplaza TODO el código de upload en Lovable
+3. Asegúrate de que `imageBytes` sea `Uint8Array` (no `Blob`)
+4. Asegúrate de que detecta signed URLs automáticamente
+
+### ✅ Paso 4: Verificar el Fix
+
+Después del cambio, los logs deben mostrar:
+
+**✅ CORRECTO**:
+```
+[NATIVE-UPLOADER] uploadMethod decision: {ticketMethod: "PUT", isSignedUrl: true, shouldUsePut: true}
+[NATIVE-UPLOADER] upload PUT: https://.../storage/v1/object/upload/sign/...
+[NATIVE-UPLOADER] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg bytes=358336
+[NATIVE-UPLOADER] upload: status=200 method=PUT
+[NATIVE-UPLOADER] upload success
+[NATIVE-UPLOADER] finalize: status=200  ← ✅ Debe ser 200
+[NATIVE-UPLOADER] finalize: body={"signedUrl":"https://...","replaced":false}  ← ✅ Éxito
+```
+
+**❌ Si aún ves POST**:
+- El código no se actualizó correctamente
+- Hay otro lugar donde se hace el upload
+- El código de Lovable se está ejecutando después del cambio
+
+### ✅ Paso 5: Debugging Adicional
+
+**Si el problema persiste después del cambio**:
+
+1. **Verificar que el cambio se aplicó**:
+   - Busca en el código: `method: 'PUT'` (debe estar presente)
+   - Busca: `body: imageBytes` (debe ser Uint8Array, no FormData)
+   - Busca: detección de `/upload/sign/`
+
+2. **Verificar que imageBytes es Uint8Array**:
+   ```javascript
+   console.log('[DEBUG] imageBytes type:', imageBytes.constructor.name);
+   // Debe ser "Uint8Array", NO "Blob" o "ArrayBuffer"
+   ```
+
+3. **Verificar que la URL se detecta correctamente**:
+   ```javascript
+   const isSignedUrl = uploadUrl.indexOf('/upload/sign/') !== -1;
+   console.log('[DEBUG] isSignedUrl:', isSignedUrl, 'uploadUrl:', uploadUrl.substring(0, 100));
+   ```
+
+4. **Verificar headers**:
+   ```javascript
+   console.log('[DEBUG] uploadHeaders:', JSON.stringify(uploadHeaders));
+   // Debe incluir 'Content-Type': 'image/jpeg' (o png, etc.)
+   // NO debe incluir 'Content-Type': 'multipart/form-data'
    ```
 
 **Verificación después del fix**:
