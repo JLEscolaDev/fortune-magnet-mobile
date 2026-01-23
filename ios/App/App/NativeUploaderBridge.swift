@@ -189,6 +189,111 @@ import Capacitor
         let bootstrapJS = """
         (function(){
           try {
+            // ============ NEW: Simple Photo Picker ============
+            // This picker ONLY selects photos and returns bytes to the web code.
+            // Upload is handled by Lovable TypeScript (processAndUpload in nativeUploader.ts)
+            // which uses uploadToSignedUrl() with PUT method.
+            
+            // Check if already installed (may have been installed by injectSimplePhotoPicker)
+            if (!window.NativePhotoPicker || !window.NativePhotoPicker.__impl) {
+              window.NativePhotoPicker = {
+                pickPhoto: function() {
+                  console.log('[NativePhotoPicker] pickPhoto called');
+
+                  return new Promise(async function(resolve, reject) {
+                    try {
+                      // Use Capacitor Camera plugin
+                      if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
+                        console.error('[NativePhotoPicker] Capacitor Camera plugin not available');
+                        reject(new Error('Camera plugin not available'));
+                        return;
+                      }
+
+                      console.log('[NativePhotoPicker] Opening photo picker...');
+                      var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
+                        quality: 90,
+                        allowEditing: false,
+                        source: 'PHOTOS',
+                        resultType: 'Uri',
+                        correctOrientation: true
+                      });
+
+                      // Check for cancellation
+                      if (cameraResult === null || cameraResult === undefined) {
+                        console.log('[NativePhotoPicker] User cancelled (null result)');
+                        resolve({ cancelled: true });
+                        return;
+                      }
+
+                      var webPath = cameraResult.webPath || cameraResult.path || '';
+                      if (!webPath) {
+                        console.log('[NativePhotoPicker] User cancelled (no webPath)');
+                        resolve({ cancelled: true });
+                        return;
+                      }
+
+                      console.log('[NativePhotoPicker] Photo selected, loading bytes...');
+
+                      // Load image from URI to get bytes
+                      var fileResp = await fetch(webPath);
+                      var blob = await fileResp.blob();
+                      var mimeType = blob.type || 'image/jpeg';
+                      var buf = await blob.arrayBuffer();
+                      var imageBytes = new Uint8Array(buf);
+
+                      // Get dimensions
+                      var width = cameraResult.width || 0;
+                      var height = cameraResult.height || 0;
+
+                      if (!width || !height) {
+                        try {
+                          var img = new Image();
+                          img.src = webPath;
+                          await new Promise(function(imgResolve, imgReject) {
+                            img.onload = imgResolve;
+                            img.onerror = imgReject;
+                            setTimeout(imgReject, 5000);
+                          });
+                          width = img.width;
+                          height = img.height;
+                        } catch (e) {
+                          console.log('[NativePhotoPicker] Could not get dimensions, using 0x0');
+                        }
+                      }
+
+                      console.log('[NativePhotoPicker] Photo ready: ' + imageBytes.length + ' bytes, ' + width + 'x' + height + ', ' + mimeType);
+
+                      resolve({
+                        bytes: imageBytes,
+                        mimeType: mimeType,
+                        width: width,
+                        height: height,
+                        cancelled: false
+                      });
+
+                    } catch (error) {
+                      var errorMsg = error.message || String(error) || '';
+                      var lowerErrorMsg = errorMsg.toLowerCase();
+
+                      // Treat cancel-related errors as cancellation
+                      if (lowerErrorMsg.includes('cancel') || lowerErrorMsg.includes('cancelled') || lowerErrorMsg.includes('user denied')) {
+                        console.log('[NativePhotoPicker] User cancelled (error contains cancel)');
+                        resolve({ cancelled: true });
+                      } else {
+                        console.error('[NativePhotoPicker] Error:', errorMsg);
+                        reject(error);
+                      }
+                    }
+                  });
+                }
+              };
+
+              // Mark picker as available - Lovable code will detect this
+              window.NativePhotoPickerAvailable = true;
+              console.log('[NativePhotoPicker] Simple picker bridge initialized');
+            }
+            // ============ END NEW ============
+
             var IMPL_VERSION = "\(NativeUploaderBridge.NATIVE_UPLOADER_IMPL_VERSION)";
             
             // Check if NativeUploader already exists with __impl defined (versioned implementation)
