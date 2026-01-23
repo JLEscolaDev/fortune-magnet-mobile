@@ -1,76 +1,97 @@
 # Native Uploader Architecture - iOS Implementation
 
+> **📅 Última Actualización**: 2026-01-23
+> 
+> **⚠️ Cambio Importante**: Se ha añadido `NativePhotoPicker` (API simplificada) que resuelve el problema de POST vs PUT. 
+> El código TypeScript de Lovable ahora maneja el upload usando `supabase.storage.uploadToSignedUrl()` que correctamente usa PUT.
+> 
+> **Recomendación**: Usar `NativePhotoPicker` + código TypeScript de Lovable en lugar del legacy `NativeUploader`.
+
 ## Tabla de Contenidos
 
 1. [Visión General](#visión-general)
 2. [Arquitectura del Sistema](#arquitectura-del-sistema)
 3. [Clases Clave](#clases-clave)
-4. [Flujo Completo de Upload](#flujo-completo-de-upload)
-5. [Selección de Fotos: Capacitor Camera Plugin](#selección-de-fotos-capacitor-camera-plugin)
-6. [Inyección de JavaScript](#inyección-de-javascript)
-7. [Comunicación Web ↔ Native](#comunicación-web--native)
-8. [Edge Functions - Contratos de API](#edge-functions---contratos-de-api)
-9. [Manejo de Memoria y Performance](#manejo-de-memoria-y-performance)
-10. [Manejo de Errores y Edge Cases](#manejo-de-errores-y-edge-cases)
-11. [Debugging y Logging](#debugging-y-logging)
-   - [Cómo Leer los Logs de iOS](#cómo-leer-los-logs-de-ios)
-   - [Logs Clave para Debugging](#logs-clave-para-debugging)
-   - [Identificar Qué Código Está Ejecutándose](#identificar-qué-código-está-ejecutándose)
-   - [Checklist de Diagnóstico para Lovable](#checklist-de-diagnóstico-para-lovable)
-12. [Cómo Modificar el Código](#cómo-modificar-el-código)
-13. [Troubleshooting](#troubleshooting)
-   - [Resumen Ejecutivo para Lovable](#resumen-ejecutivo-para-lovable)
-   - [Problema: UPLOAD_NOT_PERSISTED](#problema-upload_not_persisted---el-archivo-no-se-encuentra-después-del-upload)
-14. [Preguntas Frecuentes](#preguntas-frecuentes)
+4. [NativePhotoPicker - API Simplificada (NUEVO)](#nativephotopicker---api-simplificada-nuevo)
+5. [NativeUploader - API Legacy (Compatibilidad)](#nativeuploader---api-legacy-compatibilidad)
+6. [Flujo Completo de Upload](#flujo-completo-de-upload)
+7. [Selección de Fotos: Capacitor Camera Plugin](#selección-de-fotos-capacitor-camera-plugin)
+8. [Inyección de JavaScript](#inyección-de-javascript)
+9. [Comunicación Web ↔ Native](#comunicación-web--native)
+10. [Edge Functions - Contratos de API](#edge-functions---contratos-de-api)
+11. [Manejo de Memoria y Performance](#manejo-de-memoria-y-performance)
+12. [Manejo de Errores y Edge Cases](#manejo-de-errores-y-edge-cases)
+13. [Debugging y Logging](#debugging-y-logging)
+    - [Cómo Leer los Logs de iOS](#cómo-leer-los-logs-de-ios)
+    - [Logs Clave para Debugging](#logs-clave-para-debugging)
+    - [Identificar Qué Código Está Ejecutándose](#identificar-qué-código-está-ejecutándose)
+    - [Checklist de Diagnóstico para Lovable](#checklist-de-diagnóstico-para-lovable)
+14. [Cómo Modificar el Código](#cómo-modificar-el-código)
+15. [Troubleshooting](#troubleshooting)
+    - [Resumen Ejecutivo para Lovable](#resumen-ejecutivo-para-lovable)
+    - [Problema: UPLOAD_NOT_PERSISTED](#problema-upload_not_persisted---el-archivo-no-se-encuentra-después-del-upload)
+16. [Preguntas Frecuentes](#preguntas-frecuentes)
 
 ---
 
 ## Visión General
 
-El sistema de **Native Uploader** permite que la aplicación web (que corre en un WebView de Capacitor) pueda usar funcionalidades nativas de iOS para seleccionar y subir fotos. La arquitectura utiliza:
+El sistema de **Native Uploader** permite que la aplicación web (que corre en un WebView de Capacitor) pueda usar funcionalidades nativas de iOS para seleccionar y subir fotos.
 
-- **Swift (iOS Native)**: Maneja la inyección de JavaScript en el WebView
-- **JavaScript (Inyectado)**: Se ejecuta dentro del WebView y maneja toda la lógica de upload
+### Arquitectura Dual (2026-01-23)
+
+El sistema ahora expone **dos APIs**:
+
+1. **`NativePhotoPicker` (NUEVO - Recomendado)**:
+   - Solo maneja la selección de fotos nativa
+   - Retorna bytes + metadata al código TypeScript de Lovable
+   - El upload lo maneja Lovable usando `supabase.storage.uploadToSignedUrl()` (PUT correcto)
+   - **Ventaja**: Código compartido entre Web/iOS/Android, más fácil de mantener
+
+2. **`NativeUploader` (LEGACY - Compatibilidad)**:
+   - Maneja el pipeline completo: pick → upload → finalize
+   - Se mantiene para compatibilidad hacia atrás
+   - Será deprecado cuando todos los clientes usen el nuevo picker
+
+**Componentes**:
+- **Swift (iOS Native)**: Inyecta JavaScript en el WebView
+- **JavaScript (Inyectado)**: Expone APIs nativas al código web
 - **Capacitor Camera Plugin**: Para acceder al selector de fotos nativo de iOS
+- **Lovable TypeScript**: Maneja el upload usando Supabase SDK (`processAndUpload`)
 - **Supabase Edge Functions**: Para obtener tickets de upload y finalizar el proceso
-
-**Punto crítico**: Aunque el código está en Swift, **toda la lógica de upload se ejecuta en JavaScript dentro del WebView**. El Swift solo inyecta el código JavaScript al inicio.
 
 ---
 
 ## Arquitectura del Sistema
+
+### Arquitectura Nueva (Recomendada): NativePhotoPicker
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    iOS App (Swift)                          │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  AppDelegate.swift                                    │  │
-│  │  - Inicializa NativeUploaderBridge                   │  │
-│  │  - Inyecta JavaScript al WebView                      │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                        │                                    │
-│                        ▼                                    │
-│  ┌──────────────────────────────────────────────────────┐  │
 │  │  NativeUploaderBridge.swift                           │  │
-│  │  - Contiene JavaScript como string                    │  │
-│  │  - Lo inyecta vía webView.evaluateJavaScript()       │  │
+│  │  - Inyecta window.NativePhotoPicker                   │  │
+│  │  - Solo maneja picking (Capacitor Camera)             │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
                         │
-                        │ Inyecta JavaScript
+                        │ Retorna bytes + metadata
                         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              WebView (Capacitor)                            │
+│              WebView (Lovable TypeScript)                    │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  JavaScript Inyectado (window.NativeUploader)       │  │
+│  │  FortuneModal.tsx + nativeUploader.ts                │  │
 │  │                                                       │  │
-│  │  1. pickAndUploadFortunePhoto(options)               │  │
-│  │     ├─ Capacitor.Plugins.Camera.getPhoto()          │  │
+│  │  1. NativePhotoPicker.pickPhoto()                    │  │
+│  │     └─ Retorna: { bytes, mimeType, width, height }   │  │
+│  │                                                       │  │
+│  │  2. processAndUpload(file, options)                  │  │
 │  │     ├─ POST /functions/v1/issue-fortune-upload-ticket│  │
-│  │     ├─ PUT uploadUrl (raw bytes)                    │  │
-│  │     ├─ GET /storage/v1/object/list (verify)         │  │
+│  │     ├─ supabase.storage.uploadToSignedUrl() ✓       │  │
+│  │     │   └─ PUT con raw bytes (correcto)              │  │
 │  │     └─ POST /functions/v1/finalize-fortune-photo    │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
@@ -83,6 +104,42 @@ El sistema de **Native Uploader** permite que la aplicación web (que corre en u
 │  • Edge Function: issue-fortune-upload-ticket               │
 │  • Storage: Signed URL para PUT                            │
 │  • Edge Function: finalize-fortune-photo                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Arquitectura Legacy: NativeUploader (Compatibilidad)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    iOS App (Swift)                          │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  NativeUploaderBridge.swift                           │  │
+│  │  - Inyecta window.NativeUploader                      │  │
+│  │  - Maneja pipeline completo                           │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                        │
+                        │ Inyecta JavaScript
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│              WebView (JavaScript Inyectado)                │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  window.NativeUploader.pickAndUploadFortunePhoto()   │  │
+│  │                                                       │  │
+│  │  1. Capacitor.Plugins.Camera.getPhoto()              │  │
+│  │  2. POST /functions/v1/issue-fortune-upload-ticket   │  │
+│  │  3. PUT uploadUrl (raw bytes)                       │  │
+│  │  4. GET /storage/v1/object/list (verify)             │  │
+│  │  5. POST /functions/v1/finalize-fortune-photo         │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                        │
+                        │ HTTP Requests
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Supabase Backend                               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -149,7 +206,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 **Ubicación**: `ios/App/App/NativeUploaderBridge.swift`
 
 **Responsabilidad**:
-- Contiene el código JavaScript completo como string literal
+- Inyecta **dos APIs** en el WebView:
+  1. **`window.NativePhotoPicker`** (NUEVO): Picker simplificado que solo maneja selección
+  2. **`window.NativeUploader`** (LEGACY): API completa para compatibilidad hacia atrás
+- Contiene el código JavaScript como strings literales
 - Lo inyecta en el WebView usando `evaluateJavaScript()`
 - Verifica que la inyección fue exitosa
 
@@ -159,44 +219,209 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 @objc class NativeUploaderBridge: NSObject {
     private static let TAG = "NativeUploaderBridge"
     private static let NATIVE_UPLOADER_IMPL_VERSION = "ios-injected-v3-2026-01-18"
+    private static let NATIVE_PHOTO_PICKER_VERSION = "ios-picker-v1-2026-01-23"
     
     weak var bridgeViewController: CAPBridgeViewController?
     
-    init(bridgeViewController: CAPBridgeViewController) {
-        self.bridgeViewController = bridgeViewController
-        super.init()
+    func injectJavaScript() {
+        // Inyecta ambos sistemas
+        injectSimplePhotoPicker()  // Nuevo picker simplificado
+        injectLegacyUploader()     // Legacy para compatibilidad
     }
     
-    func injectJavaScript() {
-        let bootstrapJS = """
-        (function(){
-          // TODO EL CÓDIGO JAVASCRIPT VA AQUÍ
-        })();
-        """
-        
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self,
-                  let webView = self.bridgeViewController?.webView else {
-                return
-            }
-            
-            webView.evaluateJavaScript(bootstrapJS) { result, error in
-                // Verifica que se inyectó correctamente
-            }
-        }
+    private func injectSimplePhotoPicker() {
+        // Inyecta window.NativePhotoPicker.pickPhoto()
+        // Solo maneja selección, retorna bytes + metadata
+    }
+    
+    private func injectLegacyUploader() {
+        // Inyecta window.NativeUploader.pickAndUploadFortunePhoto()
+        // Maneja pipeline completo: pick → upload → finalize
     }
 }
 ```
 
 **Versión de Implementación**: 
-- `NATIVE_UPLOADER_IMPL_VERSION` se usa para evitar sobrescribir implementaciones existentes
-- Si `window.NativeUploader.__impl` ya existe, NO se sobrescribe
+- `NATIVE_PHOTO_PICKER_VERSION`: Versión del nuevo picker simplificado
+- `NATIVE_UPLOADER_IMPL_VERSION`: Versión del legacy uploader
+- Si `window.NativeUploader.__impl` o `window.NativePhotoPicker.__impl` ya existen, NO se sobrescriben
 - Esto permite que el código web pueda definir su propia implementación si es necesario
 
 **Cuándo modificar**:
-- **Cualquier cambio en la lógica de upload** debe hacerse aquí (en el string JavaScript)
-- Cambios en el flujo de upload
-- Cambios en los headers, métodos HTTP, etc.
+- **Nuevo picker**: Modificar `injectSimplePhotoPicker()` si necesitas cambiar la lógica de selección
+- **Legacy uploader**: Modificar `injectLegacyUploader()` si necesitas cambiar el pipeline completo
+- **⚠️ Recomendación**: Preferir modificar el código TypeScript de Lovable antes que el legacy uploader
+
+---
+
+## NativePhotoPicker - API Simplificada (NUEVO)
+
+### Visión General
+
+`NativePhotoPicker` es la nueva API simplificada que **solo maneja la selección de fotos**. El upload lo maneja el código TypeScript de Lovable usando `supabase.storage.uploadToSignedUrl()`, que correctamente usa PUT con raw bytes.
+
+**Ventajas**:
+- ✅ Código compartido entre Web/iOS/Android
+- ✅ Upload correcto usando Supabase SDK (PUT automático)
+- ✅ Más fácil de mantener y debuggear
+- ✅ Consistente con el código web
+
+### API
+
+```javascript
+// Verificar disponibilidad
+if (window.NativePhotoPickerAvailable && window.NativePhotoPicker) {
+  // Usar nuevo picker
+}
+
+// Llamar al picker
+const result = await window.NativePhotoPicker.pickPhoto();
+
+// Resultado
+{
+  bytes: Uint8Array,      // Bytes raw de la imagen
+  mimeType: string,       // "image/jpeg", "image/png", etc.
+  width: number,          // Ancho en píxeles
+  height: number,         // Alto en píxeles
+  cancelled?: boolean     // true si el usuario canceló
+}
+```
+
+### Implementación en Swift
+
+**Ubicación**: `NativeUploaderBridge.swift` - método `injectSimplePhotoPicker()`
+
+**Código JavaScript Inyectado**:
+```javascript
+window.NativePhotoPicker = {
+  pickPhoto: function() {
+    return new Promise(async function(resolve, reject) {
+      // 1. Usa Capacitor Camera para seleccionar foto
+      var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        source: 'PHOTOS',
+        resultType: 'Uri',
+        correctOrientation: true
+      });
+      
+      // 2. Carga la imagen desde webPath
+      var fileResp = await fetch(webPath);
+      var blob = await fileResp.blob();
+      var buf = await blob.arrayBuffer();
+      var bytes = new Uint8Array(buf);
+      
+      // 3. Retorna bytes + metadata
+      resolve({
+        bytes: bytes,
+        mimeType: blob.type || 'image/jpeg',
+        width: width,
+        height: height,
+        cancelled: false
+      });
+    });
+  }
+};
+```
+
+### Uso en Lovable (TypeScript)
+
+```typescript
+// En FortuneModal.tsx
+if (window.NativePhotoPickerAvailable && window.NativePhotoPicker) {
+  // 1. Seleccionar foto
+  const pickerResult = await window.NativePhotoPicker.pickPhoto();
+  
+  if (pickerResult.cancelled) {
+    return;
+  }
+  
+  // 2. Convertir bytes a File
+  const file = new File(
+    [pickerResult.bytes],
+    `photo-${Date.now()}.jpg`,
+    { type: pickerResult.mimeType }
+  );
+  
+  // 3. Usar código compartido de Lovable para upload
+  const uploadOptions = {
+    supabaseUrl: 'https://...',
+    accessToken: accessToken,
+    userId: user.id,
+    fortuneId: fortuneId
+  };
+  
+  // processAndUpload usa supabase.storage.uploadToSignedUrl() correctamente
+  await processAndUpload(uploadOptions, file, (result) => {
+    // Manejar resultado
+  });
+}
+```
+
+### Logs Esperados
+
+```
+[NativePhotoPicker] pickPhoto called
+[NativePhotoPicker] Opening photo picker...
+[NativePhotoPicker] Photo selected, loading from: capacitor://...
+[NativePhotoPicker] Photo loaded: { mimeType: "image/jpeg", bytes: 358336, width: 2048, height: 1536 }
+[PHOTO] Using new NativePhotoPicker
+[NATIVE-UPLOADER] STAGE=upload { method: "PUT", hasSignedUploadToken: true }
+[NATIVE-UPLOADER] STAGE=upload_ok
+[NATIVE-UPLOADER] STAGE=finalize
+[NATIVE-UPLOADER] STAGE=done
+```
+
+---
+
+## NativeUploader - API Legacy (Compatibilidad)
+
+### Visión General
+
+`NativeUploader` es la API legacy que maneja el pipeline completo: selección → upload → finalización. Se mantiene para compatibilidad hacia atrás pero **será deprecado** cuando todos los clientes migren a `NativePhotoPicker`.
+
+**⚠️ Nota**: Esta API tiene el problema conocido de usar POST en lugar de PUT para signed URLs. Por eso se recomienda usar `NativePhotoPicker` + código TypeScript de Lovable.
+
+### API
+
+```javascript
+// Verificar disponibilidad
+if (window.NativeUploaderAvailable && window.NativeUploader) {
+  // Usar legacy uploader
+}
+
+// Llamar al uploader
+const result = await window.NativeUploader.pickAndUploadFortunePhoto({
+  supabaseUrl: 'https://...',
+  accessToken: '...',
+  userId: '...',
+  fortuneId: '...'
+});
+
+// Resultado
+{
+  success: boolean,
+  signedUrl?: string,
+  path?: string,
+  bucket?: string,
+  width?: number,
+  height?: number,
+  cancelled?: boolean,
+  error?: string,
+  stage?: 'ticket' | 'upload' | 'verify' | 'finalize'
+}
+```
+
+### Implementación
+
+**Ubicación**: `NativeUploaderBridge.swift` - método `injectLegacyUploader()`
+
+El código JavaScript inyectado maneja todo el flujo:
+1. Selección de foto (Capacitor Camera)
+2. Obtención de ticket (edge function)
+3. Upload a Storage (PUT con raw bytes - corregido)
+4. Verificación de upload
+5. Finalización (edge function con retry)
 
 ---
 
@@ -1670,7 +1895,14 @@ if (headResponse.status === 200) {
 
 ### Resumen Ejecutivo para Lovable
 
-**⚠️ PROBLEMA CRÍTICO IDENTIFICADO**: Los logs muestran que Lovable tiene su propio código ejecutándose que NO respeta PUT.
+**✅ SOLUCIÓN IMPLEMENTADA**: Se ha añadido `NativePhotoPicker` que resuelve el problema de POST vs PUT.
+
+**Nueva Arquitectura (Recomendada)**:
+- iOS expone `window.NativePhotoPicker.pickPhoto()` que solo maneja selección
+- Lovable maneja el upload usando `processAndUpload()` → `supabase.storage.uploadToSignedUrl()`
+- Esto usa PUT correctamente automáticamente (Supabase SDK lo maneja)
+
+**⚠️ PROBLEMA LEGACY**: Los logs muestran que Lovable tiene su propio código ejecutándose que NO respeta PUT.
 
 **Evidencia de los logs**:
 ```
@@ -1687,7 +1919,19 @@ if (headResponse.status === 200) {
 - Ese código usa **POST multipart** cuando el signed URL requiere **PUT con raw bytes**
 - La URL contiene `/upload/sign/` que es un signed URL de Supabase Storage que **SIEMPRE requiere PUT**
 
-**Solución inmediata para Lovable**:
+**✅ SOLUCIÓN RECOMENDADA (Nueva Arquitectura)**:
+
+**Usar `NativePhotoPicker` + código TypeScript de Lovable**:
+1. iOS ya expone `window.NativePhotoPicker.pickPhoto()` (implementado)
+2. Lovable debe actualizar `FortuneModal.tsx` para usar el nuevo picker
+3. El código TypeScript de Lovable (`processAndUpload`) ya usa `supabase.storage.uploadToSignedUrl()` correctamente
+4. Esto resuelve el problema automáticamente porque Supabase SDK usa PUT correctamente
+
+**Ver**: [NativePhotoPicker - API Simplificada](#nativephotopicker---api-simplificada-nuevo)
+
+---
+
+**⚠️ SOLUCIÓN LEGACY (Si necesitas mantener código propio)**:
 
 1. **Buscar en el código de Lovable** donde se hace el upload (buscar `upload POST` o `fetch(uploadUrl`)
 2. **Reemplazar POST por PUT** cuando la URL contiene `/upload/sign/`

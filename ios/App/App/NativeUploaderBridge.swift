@@ -4,11 +4,22 @@ import Capacitor
 
 /**
  * Native bridge for photo picker and upload functionality on iOS.
- * Injects JavaScript that uses CapacitorCamera plugin and handles upload pipeline.
+ * 
+ * Architecture:
+ * 1. Simple Photo Picker (NEW): Exposes window.NativePhotoPicker.pickPhoto()
+ *    - Only handles photo picking, returns bytes + metadata
+ *    - Upload is handled by Lovable's TypeScript code (processAndUpload)
+ *    - Uses supabase.storage.uploadToSignedUrl() which correctly uses PUT
+ * 
+ * 2. Legacy Uploader (BACKWARDS COMPATIBILITY): Exposes window.NativeUploader.pickAndUploadFortunePhoto()
+ *    - Handles full pipeline: pick → upload → finalize
+ *    - Kept for backwards compatibility
+ *    - Will be deprecated once all clients use the new picker
  */
 @objc class NativeUploaderBridge: NSObject {
     private static let TAG = "NativeUploaderBridge"
     private static let NATIVE_UPLOADER_IMPL_VERSION = "ios-injected-v3-2026-01-18"
+    private static let NATIVE_PHOTO_PICKER_VERSION = "ios-picker-v1-2026-01-23"
     
     weak var bridgeViewController: CAPBridgeViewController?
     
@@ -18,6 +29,140 @@ import Capacitor
     }
     
     func injectJavaScript() {
+        // Inject simplified photo picker (new approach)
+        injectSimplePhotoPicker()
+        
+        // Keep legacy uploader for backwards compatibility
+        injectLegacyUploader()
+    }
+    
+    /// Injects simplified photo picker that only handles picking, not uploading
+    private func injectSimplePhotoPicker() {
+        let pickerJS = """
+        (function(){
+          try {
+            var IMPL_VERSION = "\(NativeUploaderBridge.NATIVE_PHOTO_PICKER_VERSION)";
+            
+            // Check if already installed
+            if (window.NativePhotoPicker && window.NativePhotoPicker.__impl) {
+              console.log("[NativePhotoPicker] Already installed:", window.NativePhotoPicker.__impl);
+              return;
+            }
+            
+            console.log("[NativePhotoPicker] Initializing simple photo picker bridge");
+            
+            // Simple photo picker - only handles picking, not uploading
+            window.NativePhotoPicker = {
+              __impl: IMPL_VERSION,
+              
+              pickPhoto: function() {
+                console.log("[NativePhotoPicker] pickPhoto called");
+                
+                return new Promise(async function(resolve, reject) {
+                  try {
+                    // Use Capacitor Camera plugin to pick photo
+                    if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
+                      reject(new Error('Camera plugin not available'));
+                      return;
+                    }
+                    
+                    console.log("[NativePhotoPicker] Opening photo picker...");
+                    var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
+                      quality: 90,
+                      allowEditing: false,
+                      source: 'PHOTOS',
+                      resultType: 'Uri',
+                      correctOrientation: true
+                    });
+                    
+                    // Check if cancelled
+                    if (!cameraResult || (!cameraResult.webPath && !cameraResult.path)) {
+                      console.log("[NativePhotoPicker] User cancelled photo selection");
+                      resolve({ cancelled: true });
+                      return;
+                    }
+                    
+                    var webPath = cameraResult.webPath || cameraResult.path || '';
+                    console.log("[NativePhotoPicker] Photo selected, loading from:", webPath.substring(0, 100));
+                    
+                    // Load image from URI
+                    var fileResp = await fetch(webPath);
+                    var blob = await fileResp.blob();
+                    var mimeType = blob.type || 'image/jpeg';
+                    var buf = await blob.arrayBuffer();
+                    var bytes = new Uint8Array(buf);
+                    
+                    // Get dimensions
+                    var width = cameraResult.width || 0;
+                    var height = cameraResult.height || 0;
+                    
+                    // If dimensions not provided, load image to get them
+                    if (!width || !height) {
+                      var img = new Image();
+                      img.src = webPath;
+                      await new Promise(function(imgResolve, imgReject) {
+                        img.onload = imgResolve;
+                        img.onerror = imgReject;
+                        setTimeout(imgReject, 5000);
+                      });
+                      width = img.width;
+                      height = img.height;
+                    }
+                    
+                    console.log("[NativePhotoPicker] Photo loaded:", {
+                      mimeType: mimeType,
+                      bytes: bytes.length,
+                      width: width,
+                      height: height
+                    });
+                    
+                    resolve({
+                      bytes: bytes,
+                      mimeType: mimeType,
+                      width: width,
+                      height: height,
+                      cancelled: false
+                    });
+                    
+                  } catch (error) {
+                    console.error("[NativePhotoPicker] Error picking photo:", error);
+                    if (error && (error.message || String(error)).toLowerCase().indexOf('cancel') !== -1) {
+                      resolve({ cancelled: true });
+                    } else {
+                      reject(error);
+                    }
+                  }
+                });
+              }
+            };
+            
+            // Mark picker as available
+            window.NativePhotoPickerAvailable = true;
+            
+            console.log("[NativePhotoPicker] Bridge initialized successfully");
+            
+          } catch (e) {
+            console.error("[NativePhotoPicker] Failed to initialize:", e);
+          }
+        })();
+        """
+        
+        guard let webView = bridgeViewController?.webView else {
+            print("\(NativeUploaderBridge.TAG): WebView not available for photo picker injection")
+            return
+        }
+        
+        webView.evaluateJavaScript(pickerJS) { result, error in
+            if let error = error {
+                print("\(NativeUploaderBridge.TAG): Failed to inject photo picker: \(error)")
+            } else {
+                print("\(NativeUploaderBridge.TAG): Simple photo picker injected successfully")
+            }
+        }
+    }
+    
+    /// Legacy uploader (kept for backwards compatibility)
+    private func injectLegacyUploader() {
         let bootstrapJS = """
         (function(){
           try {
@@ -407,10 +552,10 @@ import Capacitor
                         // ALWAYS log parsed ticket values - REQUIRED DEBUG LOG
                         var urlPreview = uploadUrl ? (uploadUrl.length > 80 ? uploadUrl.substring(0, 80) + '...' : uploadUrl) : 'null';
                         console.log('[NATIVE-UPLOADER] parsed ticket: url=' + urlPreview + ', path=' + (bucketRelativePath || 'null') + ', method=' + (uploadMethod || 'null') + ', field=' + formFieldName);
-                        console.log('[NATIVE-UPLOADER] ticket uploadMethod from edge function: ' + (ticketData.uploadMethod || 'NOT_PROVIDED') + ' (normalized: ' + normalizedUploadMethod + ')');
+                        console.log('[NATIVE-UPLOADER] ticket uploadMethod from edge function: ' + (ticketData.uploadMethod || 'NOT_PROVIDED'));
                         if (typeof window !== 'undefined' && window.console) {
                           window.console.log('[NATIVE-UPLOADER] parsed ticket: url=' + urlPreview + ', path=' + (bucketRelativePath || 'null') + ', method=' + (uploadMethod || 'null') + ', field=' + formFieldName);
-                          window.console.log('[NATIVE-UPLOADER] ticket uploadMethod from edge function: ' + (ticketData.uploadMethod || 'NOT_PROVIDED') + ' (normalized: ' + normalizedUploadMethod + ')');
+                          window.console.log('[NATIVE-UPLOADER] ticket uploadMethod from edge function: ' + (ticketData.uploadMethod || 'NOT_PROVIDED'));
                         }
                         
                         // Log extracted values BEFORE parsing headers (detailed logs)
@@ -687,53 +832,30 @@ import Capacitor
                         // Detect MIME type from image bytes
                         var detectedMimeType = getMimeTypeFromBytes(imageBytes);
                         
-                        // Normalize uploadMethod to uppercase for comparison
-                        // CRITICAL: Signed URLs from Supabase Storage ALWAYS require PUT, regardless of ticket uploadMethod
-                        // Signed URLs have pattern: /storage/v1/object/upload/sign/...
-                        var isSignedUrl = uploadUrl && uploadUrl.indexOf('/upload/sign/') !== -1;
-                        
-                        // FORCE PUT for signed URLs - they don't work with POST multipart
-                        // Even if ticket says POST_MULTIPART, signed URLs require PUT
-                        var finalUploadMethod;
-                        if (isSignedUrl) {
-                          finalUploadMethod = 'PUT';
-                          if (uploadMethod && uploadMethod.toUpperCase() !== 'PUT') {
-                            console.warn('[NATIVE-UPLOADER] ⚠️ WARNING: Ticket specifies uploadMethod=' + uploadMethod + ' but URL is signed URL. Forcing PUT (signed URLs require PUT).');
-                          }
-                        } else {
-                          // For non-signed URLs, use ticket method or default to POST_MULTIPART
-                          var defaultMethod = 'POST_MULTIPART';
-                          finalUploadMethod = (uploadMethod || defaultMethod).toUpperCase();
-                        }
-                        
-                        var normalizedUploadMethod = finalUploadMethod;
-                        
-                        // Log the decision for debugging
-                        console.log('[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=' + (uploadMethod || 'NOT_PROVIDED') + ', isSignedUrl=' + isSignedUrl + ', finalMethod=' + normalizedUploadMethod);
-                        if (typeof window !== 'undefined' && window.console) {
-                          window.console.log('[NATIVE-UPLOADER] uploadMethod decision: ticketMethod=' + (uploadMethod || 'NOT_PROVIDED') + ', isSignedUrl=' + isSignedUrl + ', finalMethod=' + normalizedUploadMethod);
-                        }
+                        // Step 2: Upload to Supabase signed upload URL
+                        // Check uploadMethod from ticket - use PUT for signed URLs with token (new method)
+                        // or POST multipart for legacy endpoints
                         
                         var uploadResponse;
                         var uploadHeaders = {};
                         
-                        // Build headers from ticket
-                        if (requiredHeaders && typeof requiredHeaders === 'object') {
-                          for (var key in requiredHeaders) {
-                            if (Object.prototype.hasOwnProperty.call(requiredHeaders, key)) {
-                              uploadHeaders[key] = requiredHeaders[key];
+                        if (uploadMethod === 'PUT') {
+                          // NEW: Use PUT with raw bytes (required for createSignedUploadUrl with token)
+                          // Content-Type must be the actual MIME type, not multipart
+                          uploadHeaders['Content-Type'] = detectedMimeType;  // image/jpeg, image/png, etc.
+                          
+                          // Add any required headers from ticket (except Content-Type which we set above)
+                          if (requiredHeaders && typeof requiredHeaders === 'object') {
+                            for (var key in requiredHeaders) {
+                              if (Object.prototype.hasOwnProperty.call(requiredHeaders, key)) {
+                                if (key.toLowerCase() !== 'content-type') {
+                                  uploadHeaders[key] = requiredHeaders[key];
+                                }
+                              }
                             }
                           }
-                        }
-                        
-                        if (normalizedUploadMethod === 'PUT') {
-                          // NEW: Use PUT with raw image bytes (required for signed URLs with token)
-                          console.log('[NATIVE-UPLOADER] upload PUT: ' + uploadUrl.substring(0, 100));
-                          console.log('[NativeUploader] UPLOAD_START method=PUT path=' + bucketRelativePath + ' mime=' + detectedMimeType + ' headers=' + JSON.stringify(uploadHeaders));
                           
-                          // PUT requires Content-Type header
-                          uploadHeaders['Content-Type'] = detectedMimeType;
-                          
+                          console.log('[NativeUploader] UPLOAD_START method=PUT path=' + bucketRelativePath + ' mime=' + detectedMimeType + ' bytes=' + imageBytes.length);
                           uploadResponse = await fetch(uploadUrl, {
                             method: 'PUT',
                             headers: uploadHeaders,
@@ -741,20 +863,24 @@ import Capacitor
                           });
                         } else {
                           // LEGACY: Use POST with multipart/form-data (for backwards compatibility)
-                          console.log('[NativeUploader] UPLOAD_START method=POST path=' + bucketRelativePath + ' field=' + formFieldName + ' headers=' + JSON.stringify(uploadHeaders));
+                          var formData = new FormData();
+                          formData.append(formFieldName, imageBlob, 'photo.jpg');
                           
-                          // Ensure x-upsert default if not in ticket
+                          if (requiredHeaders && typeof requiredHeaders === 'object') {
+                            for (var key in requiredHeaders) {
+                              if (Object.prototype.hasOwnProperty.call(requiredHeaders, key)) {
+                                uploadHeaders[key] = requiredHeaders[key];
+                              }
+                            }
+                          }
                           if (!uploadHeaders['x-upsert']) {
                             uploadHeaders['x-upsert'] = 'true';
                           }
                           
-                          // DO NOT set Content-Type - fetch will set it automatically with boundary when using FormData
-                          var formData = new FormData();
-                          formData.append(formFieldName, imageBlob, 'photo.jpg');
-                          
+                          console.log('[NativeUploader] UPLOAD_START method=POST path=' + bucketRelativePath + ' field=' + formFieldName);
                           uploadResponse = await fetch(uploadUrl, {
                             method: 'POST',
-                            headers: uploadHeaders,  // NO Content-Type here, fetch adds boundary
+                            headers: uploadHeaders,
                             body: formData
                           });
                         }
