@@ -13,8 +13,14 @@
 9. [Manejo de Memoria y Performance](#manejo-de-memoria-y-performance)
 10. [Manejo de Errores y Edge Cases](#manejo-de-errores-y-edge-cases)
 11. [Debugging y Logging](#debugging-y-logging)
+   - [Cómo Leer los Logs de iOS](#cómo-leer-los-logs-de-ios)
+   - [Logs Clave para Debugging](#logs-clave-para-debugging)
+   - [Identificar Qué Código Está Ejecutándose](#identificar-qué-código-está-ejecutándose)
+   - [Checklist de Diagnóstico para Lovable](#checklist-de-diagnóstico-para-lovable)
 12. [Cómo Modificar el Código](#cómo-modificar-el-código)
 13. [Troubleshooting](#troubleshooting)
+   - [Resumen Ejecutivo para Lovable](#resumen-ejecutivo-para-lovable)
+   - [Problema: UPLOAD_NOT_PERSISTED](#problema-upload_not_persisted---el-archivo-no-se-encuentra-después-del-upload)
 14. [Preguntas Frecuentes](#preguntas-frecuentes)
 
 ---
@@ -1039,11 +1045,359 @@ export async function handler(req: Request) {
 
 ## Debugging y Logging
 
-### Logs en Xcode Console
+### Cómo Leer los Logs de iOS
 
-Todos los logs de JavaScript aparecen en la consola de Xcode con el prefijo `⚡️  [log]`.
+Los logs de iOS aparecen en la consola de Xcode. Hay dos tipos de logs:
 
-**Helper de Logging**:
+1. **Logs nativos de Swift**: Aparecen directamente sin prefijo
+2. **Logs de JavaScript**: Aparecen con el prefijo `⚡️  [log]`
+
+**Ubicación de los logs**:
+- Abre Xcode
+- Ve a `View > Debug Area > Activate Console` (o presiona `Cmd+Shift+Y`)
+- Los logs aparecen en tiempo real mientras la app corre
+
+### Logs Clave para Debugging
+
+#### 1. Inyección de JavaScript
+
+**Éxito esperado**:
+```
+NativeUploaderBridge: JavaScript bridge injected
+⚡️  [log] - [NATIVE-UPLOADER][INJECTED] installed ios-injected-v3-2026-01-18
+```
+
+**Error común**:
+```
+NativeUploaderBridge: Failed to inject JavaScript: A JavaScript exception occurred
+```
+**Diagnóstico**: El JavaScript tiene un error de sintaxis o el WebView no está listo. Revisa la consola para más detalles del error.
+
+#### 2. Llamada a la Función
+
+**Éxito esperado**:
+```
+⚡️  [log] - [NATIVE-UPLOADER][INJECTED] FUNCTION CALLED - pickAndUploadFortunePhoto entry point
+[NATIVE-UPLOADER] iOS handler hit (main), reqId=1
+```
+
+**Si no aparece**: El código web no está llamando correctamente a `window.NativeUploader.pickAndUploadFortunePhoto()`.
+
+#### 3. Ticket de Upload
+
+**Éxito esperado**:
+```
+[NATIVE-UPLOADER] ticket: POST https://...supabase.co/functions/v1/issue-fortune-upload-ticket
+[NATIVE-UPLOADER] ticket: status=200
+```
+
+**Error común**:
+```
+[NATIVE-UPLOADER] ticket: status=401
+```
+**Diagnóstico**: Token de acceso inválido o expirado. Verifica que `window.__SUPABASE_ACCESS_TOKEN__` esté definido y sea válido.
+
+#### 4. Upload a Storage
+
+**⚠️ CRÍTICO: Verificar el Método HTTP**
+
+**PUT (correcto para signed URLs con token)**:
+```
+[NATIVE-UPLOADER] upload PUT: https://...supabase.co/storage/v1/object/upload/sign/...
+[NativeUploader] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg
+[NATIVE-UPLOADER] upload: status=200
+UPLOAD_OK status=200 method=PUT
+```
+
+**POST (incorrecto para signed URLs con token)**:
+```
+[NATIVE-UPLOADER] upload POST: https://...supabase.co/storage/v1/object/upload/sign/...
+[NativeUploader] UPLOAD_START method=POST path=userId/file.jpg
+[NATIVE-UPLOADER] upload: status=200
+```
+**⚠️ PROBLEMA**: Si ves `upload POST:` o `method=POST`, el código NO está respetando `uploadMethod: 'PUT'` del ticket. El upload puede retornar 200 pero el archivo no persistirá.
+
+**Cómo verificar qué método se está usando**:
+1. Busca en los logs: `[NATIVE-UPLOADER] upload PUT:` o `[NATIVE-UPLOADER] upload POST:`
+2. Busca: `UPLOAD_START method=PUT` o `UPLOAD_START method=POST`
+3. Busca: `UPLOAD_OK status=200 method=PUT` o `method=POST`
+
+**Si ves POST cuando debería ser PUT**:
+- El edge function debe retornar `uploadMethod: 'PUT'` en el ticket
+- El código JavaScript debe leer `uploadMethod` del ticket
+- El código debe usar PUT cuando `uploadMethod === 'PUT'`
+
+**Errores comunes del upload**:
+```
+[NATIVE-UPLOADER] upload: status=403
+```
+**Diagnóstico**: Signed URL expirado o token inválido. El edge function debe generar URLs con TTL suficiente (5-10 minutos).
+
+```
+[NATIVE-UPLOADER] upload: status=400
+```
+**Diagnóstico**: Request malformado. Verifica que los headers sean correctos y el body sea raw bytes (no FormData) cuando uses PUT.
+
+#### 5. Verificación de Upload
+
+**Éxito esperado**:
+```
+[NativeUploader] Verifying upload in storage...
+VERIFY_OK matches=1
+```
+
+**Error común**:
+```
+VERIFY_FAIL matches=0
+```
+**Diagnóstico**: El archivo no se encuentra en storage después del upload. Esto puede pasar si:
+- Se usó POST en lugar de PUT con signed URLs que requieren PUT
+- El archivo se subió a una ruta diferente
+- Hay un delay en Storage (raro pero posible)
+
+#### 6. Finalización
+
+**Éxito esperado**:
+```
+[NATIVE-UPLOADER] finalize: POST https://...supabase.co/functions/v1/finalize-fortune-photo
+[NATIVE-UPLOADER] finalize: status=200
+[NATIVE-UPLOADER] finalize: body={"signedUrl":"https://...","replaced":false}
+```
+
+**Error crítico - UPLOAD_NOT_PERSISTED**:
+```
+[NATIVE-UPLOADER] finalize: status=500
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED","message":"The uploaded file was not found in storage. Upload may have failed or used incorrect method."}
+```
+**⚠️ DIAGNÓSTICO CRÍTICO**: Este error significa que:
+1. El upload retornó 200 pero el archivo NO se guardó en Storage
+2. **Causa más común**: Se usó POST multipart cuando el signed URL requiere PUT con raw bytes
+3. **Solución**: Verifica que el código use PUT cuando `uploadMethod === 'PUT'`
+
+**Cómo diagnosticar UPLOAD_NOT_PERSISTED**:
+1. Revisa los logs anteriores al finalize
+2. Busca `[NATIVE-UPLOADER] upload POST:` o `upload PUT:`
+3. Si ves POST pero el ticket tiene `uploadMethod: 'PUT'`, el código no está respetando el método
+4. Verifica que el ticket response incluya `uploadMethod: 'PUT'`
+
+**Otros errores de finalize**:
+```
+[NATIVE-UPLOADER] finalize: status=401
+```
+**Diagnóstico**: Token de acceso inválido o expirado.
+
+```
+[NATIVE-UPLOADER] finalize: status=404
+```
+**Diagnóstico**: El `path` enviado a finalize no coincide con el `bucketRelativePath` del ticket, o el archivo realmente no existe.
+
+### Flujo de Logs Esperado (Éxito Completo)
+
+```
+1. NativeUploaderBridge: JavaScript bridge injected
+2. ⚡️  [log] - [NATIVE-UPLOADER][INJECTED] installed ios-injected-v3-2026-01-18
+3. [NATIVE-UPLOADER] iOS handler hit (main), reqId=1
+4. [NATIVE-UPLOADER] ticket: POST https://.../issue-fortune-upload-ticket
+5. [NATIVE-UPLOADER] ticket: status=200
+6. [NATIVE-UPLOADER] upload PUT: https://.../storage/v1/object/upload/sign/...
+7. [NativeUploader] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg
+8. [NATIVE-UPLOADER] upload: status=200
+9. UPLOAD_OK status=200 method=PUT
+10. [NativeUploader] Verifying upload in storage...
+11. VERIFY_OK matches=1
+12. [NATIVE-UPLOADER] finalize: POST https://.../finalize-fortune-photo
+13. [NATIVE-UPLOADER] finalize: status=200
+14. [NATIVE-UPLOADER] finalize: body={"signedUrl":"https://...","replaced":false}
+```
+
+### Identificar Qué Código Está Ejecutándose
+
+**⚠️ IMPORTANTE**: Puede haber DOS implementaciones diferentes:
+
+1. **JavaScript Inyectado (NativeUploaderBridge.swift)**: 
+   - Logs empiezan con `[NATIVE-UPLOADER][INJECTED]` o `[NativeUploader]`
+   - Usa `Capacitor.Plugins.Camera.getPhoto()`
+   - Ejecuta todo el flujo en JavaScript dentro del WebView
+
+2. **Código Web de Lovable**:
+   - Logs pueden empezar con `[NATIVE-UPLOADER]` pero sin `[INJECTED]`
+   - Puede tener su propia implementación que sobrescribe `window.NativeUploader`
+   - Puede hacer el upload directamente sin usar el código inyectado
+
+**Cómo identificar qué código se ejecuta**:
+
+**Si ves estos logs, está usando el código INYECTADO**:
+```
+[NATIVE-UPLOADER][INJECTED] FUNCTION CALLED - pickAndUploadFortunePhoto entry point
+[NativeUploader] Opening photo picker...
+[NativeUploader] PICKER_OK w=2048 h=1152 bytes=358336
+[NativeUploader] UPLOAD_START method=PUT path=...
+```
+
+**Si ves estos logs, está usando código de LOVABLE**:
+```
+[NATIVE-UPLOADER] iOS handler hit (main), reqId=1
+[NATIVE-UPLOADER] processAndUpload: fortuneId=...
+[NATIVE-UPLOADER] image prepared: 2048x1152 bytes=358336
+[NATIVE-UPLOADER] ticket: POST https://...
+[NATIVE-UPLOADER] upload POST: https://...
+```
+
+**Si Lovable tiene su propia implementación**:
+- El código web puede haber definido `window.NativeUploader.pickAndUploadFortunePhoto` antes de que se inyecte el código
+- El código inyectado NO sobrescribe si detecta `window.NativeUploader.__impl` existente
+- Lovable debe usar el código inyectado O implementar correctamente PUT cuando `uploadMethod === 'PUT'`
+
+**Solución si Lovable tiene código propio**:
+1. Verificar que el código de Lovable respete `uploadMethod: 'PUT'` del ticket
+2. Si usa POST multipart cuando el ticket dice PUT, cambiar a PUT con raw bytes
+3. O eliminar el código de Lovable y usar solo el código inyectado
+
+### Checklist de Diagnóstico para Lovable
+
+Cuando el upload falla, revisa estos puntos en orden:
+
+#### ✅ Paso 1: Verificar Inyección
+- [ ] ¿Aparece `NativeUploaderBridge: JavaScript bridge injected`?
+- [ ] ¿Aparece `[NATIVE-UPLOADER][INJECTED] installed`?
+- [ ] Si NO: El JavaScript no se inyectó. Revisa errores de sintaxis.
+
+#### ✅ Paso 2: Verificar Llamada
+- [ ] ¿Aparece `[NATIVE-UPLOADER] iOS handler hit`?
+- [ ] ¿Aparece `FUNCTION CALLED - pickAndUploadFortunePhoto`?
+- [ ] Si NO: El código web no está llamando la función correctamente.
+
+#### ✅ Paso 3: Verificar Ticket
+- [ ] ¿El ticket retorna `status=200`?
+- [ ] ¿El ticket incluye `uploadMethod: 'PUT'`?
+- [ ] ¿El ticket incluye `url` y `bucketRelativePath`?
+- [ ] Si NO: El edge function `issue-fortune-upload-ticket` tiene problemas.
+
+#### ✅ Paso 4: Verificar Método de Upload (CRÍTICO)
+- [ ] ¿Los logs muestran `upload PUT:` o `upload POST:`?
+- [ ] ¿Los logs muestran `UPLOAD_START method=PUT` o `method=POST`?
+- [ ] **Si ves POST pero el ticket tiene `uploadMethod: 'PUT'`**: El código JavaScript NO está respetando `uploadMethod`
+- [ ] **Solución**: Verifica que el código en `NativeUploaderBridge.swift` líneas ~659-735 use `uploadMethod` para decidir PUT vs POST
+
+#### ✅ Paso 5: Verificar Upload
+- [ ] ¿El upload retorna `status=200`?
+- [ ] ¿Los logs muestran `UPLOAD_OK`?
+- [ ] Si NO: Revisa el error específico (403 = URL expirada, 400 = request malformado)
+
+#### ✅ Paso 6: Verificar Verificación
+- [ ] ¿Los logs muestran `VERIFY_OK matches=1`?
+- [ ] Si NO: El archivo no se encuentra en storage. Esto puede indicar que se usó POST en lugar de PUT.
+
+#### ✅ Paso 7: Verificar Finalize
+- [ ] ¿El finalize retorna `status=200`?
+- [ ] ¿El body incluye `signedUrl`?
+- [ ] Si retorna `500` con `UPLOAD_NOT_PERSISTED`: El archivo no se encuentra. **Causa más común**: Se usó POST cuando debería ser PUT.
+
+### Ejemplo de Logs con Problema (UPLOAD_NOT_PERSISTED)
+
+**Logs reales de un caso fallido**:
+
+```
+[NATIVE-UPLOADER] iOS handler hit (main), reqId=1
+[NATIVE-UPLOADER] processAndUpload: fortuneId=78b21208-67cc-4d6c-b5a5-70053da3a7b6
+[NATIVE-UPLOADER] image prepared: 2048x1152 bytes=358336
+[NATIVE-UPLOADER] ticket: POST https://.../issue-fortune-upload-ticket
+[NATIVE-UPLOADER] ticket: status=200  ← ✅ Ticket OK
+[NATIVE-UPLOADER] upload POST: https://.../storage/v1/object/upload/sign/...  ← ⚠️ PROBLEMA: Dice POST
+[NATIVE-UPLOADER] upload: status=200  ← Parece exitoso pero...
+[NATIVE-UPLOADER] upload: body={"url":"/object/upload/sign/..."}  ← Retorna URL relativa
+[NATIVE-UPLOADER] finalize: POST https://.../finalize-fortune-photo
+[NATIVE-UPLOADER] finalize: status=500  ← ❌ FALLO
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED","message":"The uploaded file was not found in storage. Upload may have failed or used incorrect method."}
+[NATIVE-UPLOADER] finalize: retrying in 48.00s (left=2)  ← ⚠️ Retry con tiempo incorrecto
+```
+
+**Análisis de los logs**:
+
+1. **`[NATIVE-UPLOADER] iOS handler hit`**: Indica que está usando código de Lovable, NO el código inyectado
+2. **`upload POST:`**: ⚠️ **PROBLEMA CRÍTICO** - Está usando POST cuando debería usar PUT
+3. **`upload: status=200`**: El HTTP retorna éxito, pero Storage no persiste el archivo
+4. **`finalize: status=500` con `UPLOAD_NOT_PERSISTED`**: Confirma que el archivo no existe
+5. **`retrying in 48.00s`**: ⚠️ El retry tiene tiempos incorrectos (debería ser 1s, 2s, no 48s, 96s)
+
+**Diagnóstico**:
+- El código de Lovable está haciendo el upload directamente
+- Está usando POST multipart cuando el signed URL requiere PUT con raw bytes
+- El código de Lovable NO está respetando `uploadMethod: 'PUT'` del ticket
+
+**Solución para Lovable**:
+
+1. **Verificar el ticket response incluye `uploadMethod`**:
+   ```javascript
+   const ticketData = await ticket.json();
+   console.log('Ticket uploadMethod:', ticketData.uploadMethod);  // Debe ser 'PUT'
+   ```
+
+2. **Modificar el código de upload en Lovable para usar PUT cuando corresponda**:
+   ```javascript
+   const uploadMethod = ticketData.uploadMethod || 'POST_MULTIPART';
+   
+   if (uploadMethod === 'PUT') {
+     // PUT con raw bytes
+     const response = await fetch(ticketData.url, {
+       method: 'PUT',
+       headers: {
+         'Content-Type': mimeType  // Detectado desde los bytes de la imagen
+       },
+       body: imageBytes  // Uint8Array, NO FormData
+     });
+   } else {
+     // POST multipart (solo para compatibilidad legacy)
+     const formData = new FormData();
+     formData.append('file', imageBlob);
+     const response = await fetch(ticketData.url, {
+       method: 'POST',
+       body: formData
+     });
+   }
+   ```
+
+3. **Añadir logging para verificar**:
+   ```javascript
+   console.log('[NATIVE-UPLOADER] upload ' + uploadMethod + ':', ticketData.url.substring(0, 100));
+   console.log('[NATIVE-UPLOADER] UPLOAD_START method=' + uploadMethod + ' path=' + ticketData.bucketRelativePath);
+   ```
+
+**Logs esperados después del fix**:
+
+```
+[NATIVE-UPLOADER] ticket: status=200
+[NATIVE-UPLOADER] upload PUT: https://.../storage/v1/object/upload/sign/...  ← ✅ Debe decir PUT
+[NATIVE-UPLOADER] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg  ← ✅ Método correcto
+[NATIVE-UPLOADER] upload: status=200
+[NATIVE-UPLOADER] finalize: status=200  ← ✅ Debe ser 200, no 500
+[NATIVE-UPLOADER] finalize: body={"signedUrl":"https://...","replaced":false}  ← ✅ Éxito
+```
+
+### Problema: Retry Times Incorrectos
+
+**Síntoma**:
+```
+[NATIVE-UPLOADER] finalize: retrying in 48.00s (left=2)
+[NATIVE-UPLOADER] finalize: retrying in 96.00s (left=1)
+```
+
+**Problema**: Los tiempos de retry son incorrectos. Deberían ser:
+- Primer retry: 1 segundo
+- Segundo retry: 2 segundos
+
+**Causa**: El código de retry está usando una fórmula incorrecta o hay un bug en el cálculo del tiempo de espera.
+
+**Solución**: Verificar el código de retry en Lovable y corregir la fórmula:
+```javascript
+// ✅ CORRECTO
+var waitTime = 1000 * (retryAttempt + 1);  // 1s, 2s, 3s
+
+// ❌ INCORRECTO (ejemplo de lo que podría estar mal)
+var waitTime = 1000 * Math.pow(2, retryAttempt) * (retryAttempt + 1);  // Genera tiempos muy largos
+```
+
+### Helper de Logging
 
 ```javascript
 window.__nativeLogToXcode = function(message) {
@@ -1060,37 +1414,6 @@ window.__nativeLogToXcode = function(message) {
 if (typeof window.__nativeLogToXcode === 'function') {
   window.__nativeLogToXcode('TICKET_PARSED keys: ' + ticketKeys.join(', '));
 }
-```
-
-### Logs Clave para Debugging
-
-**1. Inyección**:
-```
-[NATIVE-UPLOADER][INJECTED] installed ios-injected-v3-2026-01-18
-```
-
-**2. Llamada a función**:
-```
-[NATIVE-UPLOADER][INJECTED] FUNCTION CALLED - pickAndUploadFortunePhoto entry point
-```
-
-**3. Ticket Response**:
-```
-[NATIVE-UPLOADER] TICKET_RESPONSE_RECEIVED status=200 ok=true
-[NATIVE-UPLOADER] ticket json keys: bucket, bucketRelativePath, url, requiredHeaders
-[NATIVE-UPLOADER] parsed ticket: url=https://..., path=userId/file.jpg
-```
-
-**4. Upload**:
-```
-[NATIVE-UPLOADER] upload PUT: https://storage.supabase.co/...
-[NATIVE-UPLOADER] upload success
-UPLOAD_OK status=200 method=PUT
-```
-
-**5. Finalize**:
-```
-FINALIZE_OK status=200 signedUrl=https://...
 ```
 
 ### Debugging en el Código Web
@@ -1286,6 +1609,28 @@ if (headResponse.status === 200) {
 
 ## Troubleshooting
 
+### Resumen Ejecutivo para Lovable
+
+**Problema más común**: `UPLOAD_NOT_PERSISTED` - El upload retorna 200 pero el archivo no se guarda.
+
+**Causa raíz**: Se está usando **POST multipart** cuando el signed URL requiere **PUT con raw bytes**.
+
+**Cómo identificar**:
+1. Busca en los logs: `[NATIVE-UPLOADER] upload POST:` ← ⚠️ Incorrecto
+2. Debe decir: `[NATIVE-UPLOADER] upload PUT:` ← ✅ Correcto
+3. Busca: `UPLOAD_START method=POST` ← ⚠️ Incorrecto
+4. Debe decir: `UPLOAD_START method=PUT` ← ✅ Correcto
+
+**Solución rápida**:
+1. Verifica que el ticket incluya `uploadMethod: 'PUT'`
+2. Modifica el código de upload para usar PUT cuando `uploadMethod === 'PUT'`
+3. Envía raw bytes (`Uint8Array`) en el body, NO `FormData`
+4. Añade header `Content-Type` con el MIME type detectado
+
+**Ver sección completa**: [Problema: UPLOAD_NOT_PERSISTED](#problema-upload_not_persisted)
+
+---
+
 ### Problema: "Native uploader NO disponible"
 
 **Causas posibles**:
@@ -1407,6 +1752,122 @@ path: 'photos/userId/file.jpg'
 // ✅ CORRECTO
 path: 'userId/file.jpg'  // bucket-relative
 ```
+
+---
+
+<a id="problema-upload_not_persisted"></a>
+### Problema: `UPLOAD_NOT_PERSISTED` - El archivo no se encuentra después del upload
+
+**Síntoma**:
+```
+[NATIVE-UPLOADER] upload: status=200
+UPLOAD_OK status=200 method=POST  ← ⚠️ Nota: method=POST
+[NATIVE-UPLOADER] finalize: status=500
+[NATIVE-UPLOADER] finalize: body={"error":"UPLOAD_NOT_PERSISTED","message":"The uploaded file was not found in storage. Upload may have failed or used incorrect method."}
+```
+
+**Diagnóstico**:
+
+Este error significa que:
+1. El upload HTTP retornó `200 OK` (parece exitoso)
+2. PERO el archivo NO se guardó en Storage
+3. Cuando finalize intenta verificar el archivo, no lo encuentra
+
+**Causa más común**: **Se usó POST multipart cuando el signed URL requiere PUT con raw bytes**
+
+**Cómo verificar**:
+
+1. **Revisa los logs del upload**:
+   ```
+   [NATIVE-UPLOADER] upload POST: https://...  ← ⚠️ Si dice POST, es el problema
+   [NATIVE-UPLOADER] upload PUT: https://...   ← ✅ Debe decir PUT
+   ```
+
+2. **Revisa el método usado**:
+   ```
+   UPLOAD_START method=POST  ← ⚠️ Incorrecto para signed URLs con token
+   UPLOAD_START method=PUT   ← ✅ Correcto
+   ```
+
+3. **Revisa el ticket response**:
+   - El edge function debe retornar `uploadMethod: 'PUT'`
+   - El código debe leer este valor y usarlo
+
+**Solución según el código que se ejecuta**:
+
+#### Si usa código INYECTADO (NativeUploaderBridge.swift):
+
+1. Verifica que el ticket incluya `uploadMethod: 'PUT'`:
+   ```json
+   {
+     "url": "https://...",
+     "bucketRelativePath": "userId/file.jpg",
+     "uploadMethod": "PUT"  ← DEBE estar presente
+   }
+   ```
+
+2. Verifica que el código respete `uploadMethod`:
+   - Busca en `NativeUploaderBridge.swift` líneas ~659-735
+   - Debe haber lógica que verifica `if (normalizedUploadMethod === 'PUT')`
+   - Si falta esta lógica, añádela (ver sección "Cómo Modificar el Código")
+
+3. Verifica los logs muestran PUT:
+   ```
+   [NATIVE-UPLOADER] upload PUT: https://...
+   [NativeUploader] UPLOAD_START method=PUT path=... mime=image/jpeg
+   ```
+
+#### Si usa código de LOVABLE:
+
+1. El código web de Lovable debe:
+   - Leer `uploadMethod` del ticket response
+   - Usar PUT cuando `uploadMethod === 'PUT'`
+   - Enviar raw bytes (`Uint8Array`) en el body, NO `FormData`
+
+2. Ejemplo de código correcto en Lovable:
+   ```javascript
+   const ticket = await fetch('/functions/v1/issue-fortune-upload-ticket', {...});
+   const ticketData = await ticket.json();
+   
+   const uploadMethod = ticketData.uploadMethod || 'POST_MULTIPART';
+   
+   if (uploadMethod === 'PUT') {
+     // PUT con raw bytes
+     await fetch(ticketData.url, {
+       method: 'PUT',
+       headers: {
+         'Content-Type': mimeType  // image/jpeg, image/png, etc.
+       },
+       body: imageBytes  // Uint8Array, NO FormData
+     });
+   } else {
+     // POST multipart (legacy)
+     const formData = new FormData();
+     formData.append('file', imageBlob);
+     await fetch(ticketData.url, {
+       method: 'POST',
+       body: formData
+     });
+   }
+   ```
+
+**Verificación después del fix**:
+
+Los logs deben mostrar:
+```
+[NATIVE-UPLOADER] upload PUT: https://...
+[NativeUploader] UPLOAD_START method=PUT path=userId/file.jpg mime=image/jpeg
+[NATIVE-UPLOADER] upload: status=200
+UPLOAD_OK status=200 method=PUT  ← ✅ Debe decir PUT
+[NATIVE-UPLOADER] finalize: status=200  ← ✅ Debe ser 200, no 500
+```
+
+**Por qué POST falla con signed URLs que requieren PUT**:
+
+- Los signed URLs de Supabase Storage con token requieren PUT con raw bytes
+- POST multipart envía datos en formato diferente que Storage no puede procesar correctamente
+- Storage retorna 200 pero no persiste el archivo porque el formato es incorrecto
+- Finalize falla porque el archivo nunca se guardó realmente
 
 ---
 
