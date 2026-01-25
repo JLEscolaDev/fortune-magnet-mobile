@@ -59,101 +59,114 @@ import Capacitor
               pickPhoto: function() {
                 console.log("[NativePhotoPicker] pickPhoto called");
                 
-                return new Promise(async function(resolve, reject) {
-                  try {
-                    // Use Capacitor Camera plugin to pick photo
-                    if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
-                      console.error("[NativePhotoPicker] Capacitor Camera plugin not available");
-                      reject(new Error('Camera plugin not available'));
-                      return;
-                    }
-                    
-                    console.log("[NativePhotoPicker] Opening photo picker...");
-                    var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
-                      quality: 90,
-                      allowEditing: false,
-                      source: 'PHOTOS',
-                      resultType: 'Uri',
-                      correctOrientation: true
-                    });
-                    
+                return new Promise(function(resolve, reject) {
+                  // Check Capacitor Camera availability
+                  if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
+                    console.error("[NativePhotoPicker] Capacitor Camera plugin not available");
+                    reject(new Error('Camera plugin not available'));
+                    return;
+                  }
+                  
+                  console.log("[NativePhotoPicker] Opening photo picker...");
+                  
+                  // Use .then() instead of async/await for better compatibility
+                  Capacitor.Plugins.Camera.getPhoto({
+                    quality: 90,
+                    allowEditing: false,
+                    source: 'PHOTOS',
+                    resultType: 'Uri',
+                    correctOrientation: true
+                  }).then(function(cameraResult) {
                     console.log("[NativePhotoPicker] Camera result received");
                     
-                    // Check if cancelled
+                    // Check for cancellation
                     if (cameraResult === null || cameraResult === undefined) {
-                      console.log("[NativePhotoPicker] User cancelled photo selection");
+                      console.log("[NativePhotoPicker] User cancelled (null result)");
                       resolve({ cancelled: true });
                       return;
                     }
                     
                     var webPath = cameraResult.webPath || cameraResult.path || '';
                     if (!webPath) {
-                      console.log("[NativePhotoPicker] No webPath or path in result");
+                      console.log("[NativePhotoPicker] User cancelled (no webPath)");
                       resolve({ cancelled: true });
                       return;
                     }
                     
-                    console.log("[NativePhotoPicker] Photo selected, loading from:", webPath.substring(0, 100));
+                    console.log("[NativePhotoPicker] Photo selected, loading bytes...");
                     
-                    // Load image from URI to get bytes
-                    var fileResp = await fetch(webPath);
-                    var blob = await fileResp.blob();
-                    var mimeType = blob.type || 'image/jpeg';
-                    var buf = await blob.arrayBuffer();
-                    var imageBytes = new Uint8Array(buf);
-                    
-                    // Get dimensions
-                    var width = cameraResult.width || 0;
-                    var height = cameraResult.height || 0;
-                    
-                    // If dimensions not provided, load image to get them
-                    if (!width || !height) {
-                      var img = new Image();
-                      img.src = webPath;
-                      await new Promise(function(imgResolve, imgReject) {
-                        img.onload = function() {
-                          width = img.width;
-                          height = img.height;
-                          imgResolve();
-                        };
-                        img.onerror = function() {
-                          // Still return bytes even if we can't get dimensions
-                          width = 0;
-                          height = 0;
-                          imgResolve();
-                        };
-                        setTimeout(function() {
-                          width = 0;
-                          height = 0;
-                          imgResolve();
-                        }, 5000);
+                    // Fetch image bytes
+                    fetch(webPath).then(function(fileResp) {
+                      return fileResp.blob();
+                    }).then(function(blob) {
+                      var mimeType = blob.type || 'image/jpeg';
+                      
+                      return blob.arrayBuffer().then(function(buf) {
+                        var imageBytes = new Uint8Array(buf);
+                        var width = cameraResult.width || 0;
+                        var height = cameraResult.height || 0;
+                        
+                        // If dimensions not provided, try to get them
+                        if (!width || !height) {
+                          var img = new Image();
+                          img.src = webPath;
+                          var dimensionPromise = new Promise(function(imgResolve) {
+                            img.onload = function() {
+                              width = img.width;
+                              height = img.height;
+                              imgResolve();
+                            };
+                            img.onerror = function() {
+                              width = 0;
+                              height = 0;
+                              imgResolve();
+                            };
+                            setTimeout(function() {
+                              width = 0;
+                              height = 0;
+                              imgResolve();
+                            }, 5000);
+                          });
+                          
+                          dimensionPromise.then(function() {
+                            console.log("[NativePhotoPicker] Photo ready: " + imageBytes.length + " bytes, " + width + "x" + height + ", " + mimeType);
+                            resolve({
+                              bytes: imageBytes,
+                              mimeType: mimeType,
+                              width: width,
+                              height: height,
+                              cancelled: false
+                            });
+                          });
+                        } else {
+                          console.log("[NativePhotoPicker] Photo ready: " + imageBytes.length + " bytes, " + width + "x" + height + ", " + mimeType);
+                          resolve({
+                            bytes: imageBytes,
+                            mimeType: mimeType,
+                            width: width,
+                            height: height,
+                            cancelled: false
+                          });
+                        }
                       });
-                    }
+                    }).catch(function(fetchErr) {
+                      console.error("[NativePhotoPicker] Fetch error:", fetchErr);
+                      reject(fetchErr);
+                    });
                     
-                    var result = {
-                      bytes: imageBytes,
-                      mimeType: mimeType,
-                      width: width,
-                      height: height,
-                      cancelled: false
-                    };
-                    
-                    console.log("[NativePhotoPicker] Photo converted: " + result.bytes.length + " bytes, " + result.width + "x" + result.height);
-                    resolve(result);
-                    
-                  } catch (error) {
-                    console.error("[NativePhotoPicker] Error picking photo:", error);
-                    var errorMsg = error && (error.message || String(error)) || 'Unknown error';
+                  }).catch(function(error) {
+                    var errorMsg = (error && error.message) ? error.message : String(error);
                     var lowerErrorMsg = errorMsg.toLowerCase();
                     
-                    // Treat camera cancellation as cancelled, not error
-                    if (lowerErrorMsg.indexOf('cancel') !== -1 || lowerErrorMsg.indexOf('cancelled') !== -1) {
-                      console.log("[NativePhotoPicker] Camera error indicates cancellation");
+                    // Treat cancel-related errors as cancellation
+                    if (lowerErrorMsg.indexOf('cancel') !== -1 || lowerErrorMsg.indexOf('cancelled') !== -1 || lowerErrorMsg.indexOf('user denied') !== -1) {
+                      console.log("[NativePhotoPicker] User cancelled");
                       resolve({ cancelled: true });
                     } else {
+                      console.error("[NativePhotoPicker] Camera error:", errorMsg);
                       reject(error);
                     }
-                  }
+                  });
                 });
               }
             };
@@ -200,24 +213,24 @@ import Capacitor
                 pickPhoto: function() {
                   console.log('[NativePhotoPicker] pickPhoto called');
 
-                  return new Promise(async function(resolve, reject) {
-                    try {
-                      // Use Capacitor Camera plugin
-                      if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
-                        console.error('[NativePhotoPicker] Capacitor Camera plugin not available');
-                        reject(new Error('Camera plugin not available'));
-                        return;
-                      }
+                  return new Promise(function(resolve, reject) {
+                    // Check Capacitor Camera availability
+                    if (typeof Capacitor === 'undefined' || !Capacitor.Plugins || !Capacitor.Plugins.Camera) {
+                      console.error('[NativePhotoPicker] Capacitor Camera plugin not available');
+                      reject(new Error('Camera plugin not available'));
+                      return;
+                    }
 
-                      console.log('[NativePhotoPicker] Opening photo picker...');
-                      var cameraResult = await Capacitor.Plugins.Camera.getPhoto({
-                        quality: 90,
-                        allowEditing: false,
-                        source: 'PHOTOS',
-                        resultType: 'Uri',
-                        correctOrientation: true
-                      });
+                    console.log('[NativePhotoPicker] Opening photo picker...');
 
+                    // Use .then() instead of async/await for better compatibility
+                    Capacitor.Plugins.Camera.getPhoto({
+                      quality: 90,
+                      allowEditing: false,
+                      source: 'PHOTOS',
+                      resultType: 'Uri',
+                      correctOrientation: true
+                    }).then(function(cameraResult) {
                       // Check for cancellation
                       if (cameraResult === null || cameraResult === undefined) {
                         console.log('[NativePhotoPicker] User cancelled (null result)');
@@ -234,56 +247,78 @@ import Capacitor
 
                       console.log('[NativePhotoPicker] Photo selected, loading bytes...');
 
-                      // Load image from URI to get bytes
-                      var fileResp = await fetch(webPath);
-                      var blob = await fileResp.blob();
-                      var mimeType = blob.type || 'image/jpeg';
-                      var buf = await blob.arrayBuffer();
-                      var imageBytes = new Uint8Array(buf);
-
-                      // Get dimensions
-                      var width = cameraResult.width || 0;
-                      var height = cameraResult.height || 0;
-
-                      if (!width || !height) {
-                        try {
-                          var img = new Image();
-                          img.src = webPath;
-                          await new Promise(function(imgResolve, imgReject) {
-                            img.onload = imgResolve;
-                            img.onerror = imgReject;
-                            setTimeout(imgReject, 5000);
-                          });
-                          width = img.width;
-                          height = img.height;
-                        } catch (e) {
-                          console.log('[NativePhotoPicker] Could not get dimensions, using 0x0');
-                        }
-                      }
-
-                      console.log('[NativePhotoPicker] Photo ready: ' + imageBytes.length + ' bytes, ' + width + 'x' + height + ', ' + mimeType);
-
-                      resolve({
-                        bytes: imageBytes,
-                        mimeType: mimeType,
-                        width: width,
-                        height: height,
-                        cancelled: false
+                      // Fetch image bytes
+                      fetch(webPath).then(function(fileResp) {
+                        return fileResp.blob();
+                      }).then(function(blob) {
+                        var mimeType = blob.type || 'image/jpeg';
+                        
+                        return blob.arrayBuffer().then(function(buf) {
+                          var imageBytes = new Uint8Array(buf);
+                          var width = cameraResult.width || 0;
+                          var height = cameraResult.height || 0;
+                          
+                          // If dimensions not provided, try to get them
+                          if (!width || !height) {
+                            var img = new Image();
+                            img.src = webPath;
+                            var dimensionPromise = new Promise(function(imgResolve) {
+                              img.onload = function() {
+                                width = img.width;
+                                height = img.height;
+                                imgResolve();
+                              };
+                              img.onerror = function() {
+                                width = 0;
+                                height = 0;
+                                imgResolve();
+                              };
+                              setTimeout(function() {
+                                width = 0;
+                                height = 0;
+                                imgResolve();
+                              }, 5000);
+                            });
+                            
+                            dimensionPromise.then(function() {
+                              console.log('[NativePhotoPicker] Photo ready: ' + imageBytes.length + ' bytes, ' + width + 'x' + height + ', ' + mimeType);
+                              resolve({
+                                bytes: imageBytes,
+                                mimeType: mimeType,
+                                width: width,
+                                height: height,
+                                cancelled: false
+                              });
+                            });
+                          } else {
+                            console.log('[NativePhotoPicker] Photo ready: ' + imageBytes.length + ' bytes, ' + width + 'x' + height + ', ' + mimeType);
+                            resolve({
+                              bytes: imageBytes,
+                              mimeType: mimeType,
+                              width: width,
+                              height: height,
+                              cancelled: false
+                            });
+                          }
+                        });
+                      }).catch(function(fetchErr) {
+                        console.error('[NativePhotoPicker] Fetch error:', fetchErr);
+                        reject(fetchErr);
                       });
-
-                    } catch (error) {
-                      var errorMsg = error.message || String(error) || '';
+                      
+                    }).catch(function(error) {
+                      var errorMsg = (error && error.message) ? error.message : String(error);
                       var lowerErrorMsg = errorMsg.toLowerCase();
-
+                      
                       // Treat cancel-related errors as cancellation
-                      if (lowerErrorMsg.includes('cancel') || lowerErrorMsg.includes('cancelled') || lowerErrorMsg.includes('user denied')) {
-                        console.log('[NativePhotoPicker] User cancelled (error contains cancel)');
+                      if (lowerErrorMsg.indexOf('cancel') !== -1 || lowerErrorMsg.indexOf('cancelled') !== -1 || lowerErrorMsg.indexOf('user denied') !== -1) {
+                        console.log('[NativePhotoPicker] User cancelled');
                         resolve({ cancelled: true });
                       } else {
-                        console.error('[NativePhotoPicker] Error:', errorMsg);
+                        console.error('[NativePhotoPicker] Camera error:', errorMsg);
                         reject(error);
                       }
-                    }
+                    });
                   });
                 }
               };
@@ -520,9 +555,76 @@ import Capacitor
                         }
                         var fortuneId = options.fortuneId;
                         console.log('[NativeUploader] Using Supabase URL:', supabaseUrl);
-                        console.log('[NativeUploader] Step 1: Requesting upload ticket');
-
-                        // Step 1: Issue upload ticket (POST to Supabase Edge Function)
+                        
+                        // Helper function to convert Uint8Array to base64
+                        function uint8ArrayToBase64(bytes) {
+                          var binary = '';
+                          var len = bytes.byteLength;
+                          for (var i = 0; i < len; i++) {
+                            binary += String.fromCharCode(bytes[i]);
+                          }
+                          return btoa(binary);
+                        }
+                        
+                        // Try direct upload method first (upload-fortune-photo edge function)
+                        // This bypasses signed URL issues with POST/FormData
+                        console.log('[NativeUploader] Attempting direct upload method (upload-fortune-photo)...');
+                        try {
+                          var imageBase64 = uint8ArrayToBase64(imageBytes);
+                          var directUploadBody = {
+                            fortune_id: fortuneId,
+                            image_base64: imageBase64,
+                            mime_type: mimeType,
+                            width: width || 0,
+                            height: height || 0
+                          };
+                          
+                          console.log('[NativeUploader] Direct upload: fortune_id=' + fortuneId + ', mime=' + mimeType + ', size=' + imageBytes.length + ' bytes, base64_length=' + imageBase64.length);
+                          
+                          var directUploadResponse = await fetch(supabaseUrl + '/functions/v1/upload-fortune-photo', {
+                            method: 'POST',
+                            headers: headers,
+                            body: JSON.stringify(directUploadBody)
+                          });
+                          
+                          var directUploadText = await directUploadResponse.text();
+                          console.log('[NativeUploader] Direct upload response: status=' + directUploadResponse.status + ', ok=' + directUploadResponse.ok);
+                          
+                          if (directUploadResponse.ok) {
+                            try {
+                              var directUploadData = JSON.parse(directUploadText);
+                              console.log('[NativeUploader] Direct upload SUCCESS:', directUploadData);
+                              
+                              if (directUploadData.signedUrl) {
+                                resolveOnce({
+                                  success: true,
+                                  bucket: directUploadData.media?.bucket || 'photos',
+                                  path: directUploadData.media?.path || '',
+                                  mime: mimeType,
+                                  width: width || 0,
+                                  height: height || 0,
+                                  sizeBytes: imageBytes.length,
+                                  signedUrl: directUploadData.signedUrl,
+                                  replaced: directUploadData.replaced || false,
+                                  media: directUploadData.media,
+                                  buildTag: directUploadData.buildTag || 'direct-upload-v1'
+                                });
+                                return;
+                              } else {
+                                console.warn('[NativeUploader] Direct upload succeeded but no signedUrl, falling back to signed URL method');
+                              }
+                            } catch (parseErr) {
+                              console.warn('[NativeUploader] Direct upload response parse error, falling back:', parseErr);
+                            }
+                          } else {
+                            console.warn('[NativeUploader] Direct upload failed (status=' + directUploadResponse.status + '), falling back to signed URL method:', directUploadText.substring(0, 200));
+                          }
+                        } catch (directErr) {
+                          console.warn('[NativeUploader] Direct upload error, falling back to signed URL method:', directErr.message || String(directErr));
+                        }
+                        
+                        // Fallback to signed URL method (legacy)
+                        console.log('[NativeUploader] Step 1: Requesting upload ticket (signed URL method)');
                         console.log('[NativeUploader] About to fetch ticket from:', supabaseUrl + '/functions/v1/issue-fortune-upload-ticket');
                         console.log('[NativeUploader] Request headers:', JSON.stringify(headers).substring(0, 300));
                         console.log('[NativeUploader] Request body:', JSON.stringify({ fortune_id: fortuneId, mime: mimeType }));
